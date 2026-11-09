@@ -1,0 +1,12 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: parsing
+      POSTGRES_PASSWORD: parsing
+      POSTGRES_DB: parsing
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data

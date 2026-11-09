@@ -1,0 +1,72 @@
+:root {
+  --bg: #f4f4f1; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #55544e; --ink-3: #8a897f;
+  --line: #e1e0d9; --line-2: #c3c2b7; --accent: #2a6fdb; --accent-track: #dbe7fa;
+  --good: #0ca30c; --warning: #fab219; --warning-track: #fdeec8; --serious: #ec835a;
+  --critical: #d03b3b; --critical-track: #f6dada; --focus: #2a6fdb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111110; --surface: #1a1a19; --ink: #f2f1ec; --ink-2: #b5b4aa; --ink-3: #85847a;
+    --line: #2c2c2a; --line-2: #383835; --accent: #5b96f0; --accent-track: #1f2f4a;
+    --warning-track: #46380f; --critical-track: #4a1d1d; --focus: #5b96f0;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: inherit; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 16px; margin: 0 0 12px; }
+p.sub { color: var(--ink-2); margin: 0 0 20px; }
+
+.shell { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+.side { background: var(--surface); border-right: 1px solid var(--line); padding: 20px 12px; display: flex; flex-direction: column; gap: 4px; }
+.brand { font-weight: 700; padding: 0 10px 16px; }
+.side a { padding: 8px 10px; border-radius: 6px; text-decoration: none; }
+.side a.on { background: var(--bg); font-weight: 600; }
+.side .soon { padding: 8px 10px; color: var(--ink-3); }
+.side form { margin-top: auto; }
+main { padding: 28px 32px; max-width: 1200px; min-width: 0; }
+@media (max-width: 760px) {
+  .shell { grid-template-columns: 1fr; }
+  .side { flex-direction: row; flex-wrap: wrap; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand { padding: 0 10px; } .side .soon { display: none; } .side form { margin: 0 0 0 auto; }
+  main { padding: 20px 14px; }
+}
+
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px; margin-bottom: 20px; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 500; color: var(--ink-2); font-size: 12px; padding: 6px 10px; border-bottom: 1px solid var(--line-2); white-space: nowrap; }
+td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.muted { color: var(--ink-2); font-size: 12px; }
+.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--ink-2); }
+.err { color: var(--ink-2); font-size: 12px; max-width: 260px; overflow-wrap: anywhere; }
+
+.status { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.status i { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+.meter { min-width: 170px; }
+.meter .track { height: 8px; border-radius: 4px; overflow: hidden; }
+.meter .fill { height: 100%; border-radius: 4px; min-width: 2px; }
+.meter .nums { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.meter .nums b { color: var(--ink); font-weight: 600; }
+
+form.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; align-items: end; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+input, select { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line-2); border-radius: 6px; padding: 7px 9px; min-width: 0; }
+button { font: inherit; cursor: pointer; border-radius: 6px; padding: 7px 12px; border: 1px solid var(--line-2); background: var(--surface); color: var(--ink); white-space: nowrap; }
+button.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+button.link { border: 0; background: none; padding: 2px 4px; color: var(--ink-2); text-decoration: underline; }
+button.link.danger { color: var(--critical); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.actions form { display: inline; }
+.inline { display: flex; gap: 6px; }
+.inline input { width: 100%; }
+
+.flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; background: var(--surface); border: 1px solid var(--line-2); }
+.empty { color: var(--ink-2); padding: 12px 0; }
+.login { max-width: 340px; margin: 14vh auto; }
+.login form { display: flex; flex-direction: column; gap: 12px; }
