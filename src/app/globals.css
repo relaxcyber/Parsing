@@ -2,13 +2,13 @@
   --bg: #f4f4f1; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #55544e; --ink-3: #8a897f;
   --line: #e1e0d9; --line-2: #c3c2b7; --accent: #2a6fdb; --accent-track: #dbe7fa;
   --good: #0ca30c; --warning: #fab219; --warning-track: #fdeec8; --serious: #ec835a;
-  --critical: #d03b3b; --critical-track: #f6dada; --focus: #2a6fdb;
+  --critical: #d03b3b; --critical-text: #b42a2a; --critical-track: #f6dada; --focus: #2a6fdb;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #111110; --surface: #1a1a19; --ink: #f2f1ec; --ink-2: #b5b4aa; --ink-3: #85847a;
     --line: #2c2c2a; --line-2: #383835; --accent: #5b96f0; --accent-track: #1f2f4a;
-    --warning-track: #46380f; --critical-track: #4a1d1d; --focus: #5b96f0;
+    --warning-track: #46380f; --critical-text: #f28b8b; --critical-track: #4a1d1d; --focus: #5b96f0;
   }
 }
 * { box-sizing: border-box; }
@@ -59,7 +59,7 @@ input, select { font: inherit; color: var(--ink); background: var(--bg); border:
 button { font: inherit; cursor: pointer; border-radius: 6px; padding: 7px 12px; border: 1px solid var(--line-2); background: var(--surface); color: var(--ink); white-space: nowrap; }
 button.primary { background: var(--ink); color: var(--surface); border-color: var(--ink); }
 button.link { border: 0; background: none; padding: 2px 4px; color: var(--ink-2); text-decoration: underline; }
-button.link.danger { color: var(--critical); }
+button.link.danger { color: var(--critical-text); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 .actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .actions form { display: inline; }

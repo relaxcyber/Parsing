@@ -1,6 +1,6 @@
 import type { ContentItemInput } from "@/core/contract";
 import type { Db } from "@/db/client";
-import { withKey } from "@/keys/router";
+import { NotChargedError, withKey } from "@/keys/router";
 import { postJson } from "./http";
 
 const httpUrl = (v: unknown) => (typeof v === "string" && /^https?:\/\//.test(v) ? v : undefined);
@@ -27,10 +27,10 @@ export async function fetchFirecrawl(db: Db, url: string): Promise<ContentItemIn
     "firecrawl",
     async (key, usage) => {
       const res = await postJson("https://api.firecrawl.dev/v1/scrape", key.secret, { url, formats: ["markdown"] }, 90_000);
-      if (!res?.success || !res.data) throw new Error(`Firecrawl: ${res?.error ?? "порожня відповідь"}`);
+      if (!res?.success || !res.data) throw new NotChargedError(`Firecrawl: ${res?.error ?? "порожня відповідь"}`);
       usage.units = Number(res.data.metadata?.creditsUsed) || 1;
       return mapFirecrawl(res.data, url);
     },
-    { purpose: "scrape" },
+    { purpose: "scrape", retryTransient: true },
   );
 }

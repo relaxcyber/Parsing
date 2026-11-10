@@ -4,11 +4,13 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetScraplingCache } from "@/collect/scrapling";
 import { ContentItemSchema } from "@/core/contract";
-import { collect, saveItems } from "@/collect";
+import { eq } from "drizzle-orm";
+import { AlreadyRunningError, collect, saveItems } from "@/collect";
+import { assertPublicUrl, isPrivateAddress, UnsafeUrlError } from "@/collect/net";
 import { mapFirecrawl } from "@/collect/firecrawl";
-import { mapPost, mapProfile } from "@/collect/instagram";
+import { mapPost, mapProfile, runCostUsd } from "@/collect/instagram";
 import { extractHtml } from "@/collect/local";
-import { contentItems, usageEvents } from "@/db/schema";
+import { collectRuns, contentItems, usageEvents } from "@/db/schema";
 import { addTestKey, testDb } from "./helpers";
 
 // Підроблений scrapling: поведінку задає змінна FAKE_SCRAPLING (http=...;stealth=...).
@@ -37,6 +39,16 @@ const html = (body: string, head = "") => `<html lang="uk"><head><title>Назв
 const longText = "Справжній вміст статті. ".repeat(30);
 const page = (text: string, init: ResponseInit = {}) =>
   new Response(text, { headers: { "content-type": "text/html; charset=utf-8" }, ...init });
+
+/** Підробка асинхронного API Apify: створення запуску, його стан із вартістю, набір даних, звірка лімітів. */
+const apifyMock = (items: unknown[]) =>
+  vi.fn(async (url: string, _init?: any) => {
+    if (url.includes("/users/me/limits")) return Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0.02 } } });
+    if (url.endsWith("/runs")) return Response.json({ data: { id: "run1", status: "RUNNING", defaultDatasetId: "ds1" } }, { status: 201 });
+    if (url.includes("/actor-runs/run1")) return Response.json({ data: { id: "run1", status: "SUCCEEDED", defaultDatasetId: "ds1", usageTotalUsd: 0.0123 } });
+    if (url.includes("/datasets/ds1/items")) return Response.json(items);
+    throw new Error(`unexpected ${url}`);
+  });
 
 describe("local extraction", () => {
   it("pulls title, text, author, image and date; drops chrome", () => {
@@ -83,6 +95,16 @@ describe("instagram mapping", () => {
     expect(items.map((i) => i.kind)).toEqual(["profile", "video"]);
     expect(items[0].author?.links).toEqual(["https://beacons.ai/maker", "https://stan.store/maker"]);
     expect(items[1].author?.username).toBe("maker");
+  });
+});
+
+describe("apify run cost", () => {
+  const pricingInfo = { pricingPerEvent: { actorChargeEvents: { result: { isPrimaryEvent: true, eventPriceUsd: 0.0026 }, extra: { eventPriceUsd: 0.007 } } } };
+  it("uses the larger of Apify's total, charged events and a per-result estimate", () => {
+    expect(runCostUsd({ usageTotalUsd: 0.013, pricingInfo, chargedEventCounts: { result: 5 } }, 5)).toBe(0.013);
+    expect(runCostUsd({ usageTotalUsd: 0, pricingInfo, chargedEventCounts: { result: 5, extra: 1 } }, 5)).toBe(0.02);
+    expect(runCostUsd({ pricingInfo, chargedEventCounts: {} }, 3)).toBe(0.0078);
+    expect(runCostUsd({}, 3)).toBe(0);
   });
 });
 
@@ -171,25 +193,167 @@ describe("cascade", () => {
     await expect(collect(db, { type: "url", url: "https://guarded.example/" })).rejects.toThrow(/HTTP 403.*Firecrawl немає/s);
   });
 
-  it("routes an Instagram profile URL to Apify and upserts on repeat", async () => {
+  it("routes an Instagram profile URL to Apify, records the run's real cost, caches and upserts", async () => {
     const db = await testDb();
     await addTestKey(db, "apify", "ap");
-    const calls: string[] = [];
-    vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
-      calls.push(url);
-      if (url.includes("/users/me/limits")) return Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0.01 } } });
-      expect(JSON.parse(init.body)).toEqual({ usernames: ["maker"] });
-      return Response.json([{ username: "maker", followersCount: 10, latestPosts: [{ shortCode: "P1", url: "https://www.instagram.com/p/P1/", type: "Image", displayUrl: "https://cdn.example/1.jpg" }] }]);
-    }));
+    const fetchMock = apifyMock([{ username: "maker", followersCount: 10, latestPosts: [{ shortCode: "P1", url: "https://www.instagram.com/p/P1/", type: "Image", displayUrl: "https://cdn.example/1.jpg" }] }]);
+    vi.stubGlobal("fetch", fetchMock);
     const r = await collect(db, { type: "url", url: "https://www.instagram.com/maker/" });
     expect(r.items.map((i) => i.id)).toEqual(["profile:maker", "P1"]);
-    expect(calls[0]).toContain("instagram-profile-scraper");
-    await collect(db, { type: "instagram-profile", username: "@maker" });
+    expect(r.ids).toHaveLength(2);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ usernames: ["maker"] });
+    expect(fetchMock.mock.calls[0][0]).toContain("instagram-profile-scraper/runs");
+    expect((await db.select().from(usageEvents))[0]).toMatchObject({ ok: true, units: 0.0123, purpose: "instagram-profile" });
+    const [profileRow] = await db.select().from(contentItems).where(eq(contentItems.externalId, "profile:maker"));
+    expect((profileRow.raw as any).followersCount).toBe(10);
+
+    const runs = fetchMock.mock.calls.length;
+    const again = await collect(db, { type: "instagram-profile", username: "@Maker" });
+    expect(again.cached).toBe(true);
+    expect(fetchMock.mock.calls.length).toBe(runs);
+    await collect(db, { type: "instagram-profile", username: "maker" }, { fresh: true });
     expect(await db.select().from(contentItems)).toHaveLength(2);
   });
 
-  it("rejects items that break the contract", async () => {
+  it("fails loudly when the actor's format changes instead of reporting an empty result", async () => {
     const db = await testDb();
-    await expect(saveItems(db, [{ id: "", source: "web", kind: "article", url: "https://a.example", fetchedAt: new Date(), via: "local" }])).rejects.toThrow();
+    await addTestKey(db, "apify", "ap");
+    vi.stubGlobal("fetch", apifyMock([{ code: "X1", link: "https://www.instagram.com/p/X1/" }]));
+    await expect(collect(db, { type: "instagram-hashtag", tag: "ugc", limit: 5 })).rejects.toThrow(/змінив формат.*X1/s);
+    const [run] = await db.select().from(collectRuns);
+    expect(run.status).toBe("failed");
+  });
+
+  it("refuses to start the same collection twice", async () => {
+    const db = await testDb();
+    await db.insert(collectRuns).values({ targetKey: "ig-profile:maker" });
+    await expect(collect(db, { type: "instagram-profile", username: "maker" })).rejects.toBeInstanceOf(AlreadyRunningError);
+    // покинутий запуск (старший за 20 хв) не блокує назавжди
+    await db.update(collectRuns).set({ startedAt: new Date(Date.now() - 30 * 60_000) });
+    await addTestKey(db, "apify", "ap");
+    vi.stubGlobal("fetch", apifyMock([{ username: "maker" }]));
+    expect((await collect(db, { type: "instagram-profile", username: "maker" })).items).toHaveLength(1);
+  });
+
+  it("does not spend a Firecrawl credit on a page that does not exist", async () => {
+    const db = await testDb();
+    await addTestKey(db, "firecrawl", "fc");
+    const fetchMock = vi.fn(async () => page("gone", { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(collect(db, { type: "url", url: "https://open.example/typo" })).rejects.toThrow(/HTTP 404/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(usageEvents)).toHaveLength(0);
+  });
+
+  it("treats tracking parameters and fragments as the same page", async () => {
+    const db = await testDb();
+    const fetchMock = vi.fn(async () => page(html(`<main>${longText}</main>`)));
+    vi.stubGlobal("fetch", fetchMock);
+    await collect(db, { type: "url", url: "https://open.example/a?id=1" });
+    const again = await collect(db, { type: "url", url: "https://OPEN.example/a?utm_source=tg&id=1&fbclid=x#top" });
+    expect(again.cached).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(contentItems)).toHaveLength(1);
+  });
+
+  it("retries Firecrawl on another key after a 502 and does not charge an unbilled failure", async () => {
+    const db = await testDb();
+    await addTestKey(db, "firecrawl", "A");
+    await addTestKey(db, "firecrawl", "B");
+    let n = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (!url.includes("firecrawl.dev")) return page("no", { status: 403 });
+      return ++n === 1 ? new Response("bad gateway", { status: 502 }) : Response.json({ success: true, data: { markdown: "ok", metadata: {} } });
+    }));
+    expect((await collect(db, { type: "url", url: "https://guarded.example/r" })).items[0].via).toBe("firecrawl");
+    const events = await db.select().from(usageEvents).orderBy(usageEvents.id);
+    expect(events.map((e) => [e.ok, e.units])).toEqual([[false, 0], [true, 1]]);
+
+    vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+      url.includes("firecrawl.dev") ? Response.json({ success: false, error: "unsupported site" }) : page("no", { status: 403 })));
+    await expect(collect(db, { type: "url", url: "https://guarded.example/s" })).rejects.toThrow(/unsupported site/);
+    expect((await db.select().from(usageEvents).orderBy(usageEvents.id)).at(-1)).toMatchObject({ ok: false, units: 0 });
+  });
+
+  it("saves the good items of a batch, skipping a broken one and a duplicate", async () => {
+    const db = await testDb();
+    const base = { source: "instagram" as const, kind: "post" as const, fetchedAt: new Date(), via: "apify" as const };
+    const r = await saveItems(db, [
+      { ...base, id: "A", url: "https://www.instagram.com/p/A/" },
+      { ...base, id: "B", url: "not a url" },
+      { ...base, id: "A", url: "https://www.instagram.com/p/A/" },
+      { ...base, id: "C", url: "https://www.instagram.com/p/C/", media: [{ type: "image", url: "javascript:alert(1)" }] },
+      { ...base, id: "D", url: "https://www.instagram.com/p/D/" },
+    ]);
+    expect(r.items.map((i) => i.id)).toEqual(["A", "D"]);
+    expect(r.ids).toHaveLength(2);
+    expect(r.skipped).toHaveLength(2);
+    expect(r.skipped[0]).toContain("B: url");
+    expect(await db.select().from(contentItems)).toHaveLength(2);
+  });
+});
+
+describe("network guard", () => {
+  it("recognises private and special addresses", () => {
+    for (const ip of ["127.0.0.1", "10.0.0.1", "172.16.5.4", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "fe80::1", "fd00::1", "::ffff:10.0.0.1"]) {
+      expect(isPrivateAddress(ip), ip).toBe(true);
+    }
+    for (const ip of ["8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"]) expect(isPrivateAddress(ip), ip).toBe(false);
+  });
+
+  it("rejects internal targets, credentials and non-http schemes", async () => {
+    const pub = async () => ["93.184.216.34"];
+    for (const u of ["http://127.0.0.1:3000/", "http://[::1]/", "http://10.0.0.1/", "http://localhost/", "http://router.local/", "file:///etc/passwd", "https://user:pw@site.example/"]) {
+      await expect(assertPublicUrl(u, pub), u).rejects.toBeInstanceOf(UnsafeUrlError);
+    }
+    await expect(assertPublicUrl("https://site.example/", async () => ["10.1.2.3"])).rejects.toThrow(/внутрішню мережу/);
+    await expect(assertPublicUrl("https://site.example/", pub)).resolves.toBeInstanceOf(URL);
+  });
+
+  it("blocks a public page that redirects to an internal address, without falling back to paid tiers", async () => {
+    const db = await testDb();
+    await addTestKey(db, "firecrawl", "fc");
+    const fetchMock = vi.fn(async () => new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data/" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(collect(db, { type: "url", url: "https://open.example/redirect" })).rejects.toBeInstanceOf(UnsafeUrlError);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(collect(db, { type: "url", url: "http://192.168.1.1/admin" })).rejects.toBeInstanceOf(UnsafeUrlError);
+  });
+});
+
+describe("page decoding", () => {
+  it("keeps paragraph boundaries", () => {
+    const item = extractHtml(html("<article><h1>Заголовок</h1><p>Перший абзац.</p><p>Другий<br>рядок.</p><ul><li>Пункт</li></ul></article>"), "https://b.example/");
+    expect(item.text).toBe("Заголовок\n\nПерший абзац.\n\nДругий\nрядок.\n\nПункт");
+  });
+
+  it("decodes windows-1251 pages", async () => {
+    const db = await testDb();
+    const body = `<html><head><meta charset="windows-1251"><title>Тест</title></head><body><main>${"Привіт, це кирилиця. ".repeat(20)}</main></body></html>`;
+    const bytes = new Uint8Array([...body].map((ch) => {
+      const c = ch.charCodeAt(0);
+      if (c < 128) return c;
+      if (c >= 0x410 && c <= 0x44f) return c - 0x350;
+      return ({ 0x456: 0xb3, 0x406: 0xb2 } as Record<number, number>)[c] ?? 63;
+    }));
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(bytes, { headers: { "content-type": "text/html" } })));
+    const r = await collect(db, { type: "url", url: "https://cp1251.example/" });
+    expect(r.items[0].title).toBe("Тест");
+    expect(r.items[0].text).toContain("Привіт, це кирилиця.");
+  });
+
+  it("does not mistake an article that mentions 'Access Denied' for a bot wall", async () => {
+    const db = await testDb();
+    vi.stubGlobal("fetch", vi.fn(async () => page(html(`<main><p>How to fix Access Denied errors.</p><p>${"Long explanation. ".repeat(120)}</p></main>`))));
+    expect((await collect(db, { type: "url", url: "https://blog.example/access-denied" })).items[0].via).toBe("local");
+  });
+});
+
+describe("contract urls", () => {
+  it("rejects javascript: and file: links", () => {
+    const base = { id: "1", source: "web", kind: "article", fetchedAt: new Date(), via: "local" };
+    expect(() => ContentItemSchema.parse({ ...base, url: "javascript:alert(1)" })).toThrow();
+    expect(() => ContentItemSchema.parse({ ...base, url: "https://a.example", author: { links: ["file:///etc/passwd"] } })).toThrow();
+    expect(() => ContentItemSchema.parse({ ...base, url: "https://a.example", author: { links: ["https://beacons.ai/x"] } })).not.toThrow();
   });
 });

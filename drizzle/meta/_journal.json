@@ -15,6 +15,13 @@
       "when": 1794297872373,
       "tag": "0001_true_red_hulk",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794299549170,
+      "tag": "0002_known_maximus",
+      "breakpoints": true
     }
   ]
 }

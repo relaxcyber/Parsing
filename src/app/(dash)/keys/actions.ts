@@ -33,10 +33,17 @@ export async function toggleKey(form: FormData) {
   const db = getDb();
   const [key] = await db.select().from(apiKeys).where(eq(apiKeys.id, id(form)));
   if (!key) return back("Ключ не знайдено");
-  // «Увімкнути» також знімає паузу та позначку «недійсний».
-  const status = key.status === "active" ? "disabled" : "active";
+  // Активний ключ на паузі: кнопка знімає паузу, а не вимикає його.
+  const paused = key.status === "active" && key.cooldownUntil != null && key.cooldownUntil > new Date();
+  const status = key.status === "active" && !paused ? "disabled" : "active";
   await db.update(apiKeys).set({ status, cooldownUntil: null, lastError: null }).where(eq(apiKeys.id, key.id));
-  back(status === "active" ? "Ключ увімкнено" : "Ключ вимкнено");
+  back(paused ? "Паузу знято" : status === "active" ? "Ключ увімкнено" : "Ключ вимкнено");
+}
+
+export async function resetUsage(form: FormData) {
+  await requireAuth();
+  await getDb().update(apiKeys).set({ quotaUsed: 0, periodStartedAt: new Date() }).where(eq(apiKeys.id, id(form)));
+  back("Лічильник скинуто");
 }
 
 export async function deleteKey(form: FormData) {

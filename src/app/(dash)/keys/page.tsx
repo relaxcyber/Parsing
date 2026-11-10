@@ -4,7 +4,8 @@ import { apiKeys, providers, usageEvents, type ApiKey, type Provider } from "@/d
 import { SECRET_HINTS } from "@/keys/presets";
 import { canSync } from "@/keys/quota-sync";
 import { availableAt, effectiveUsed, keyState, nextPeriodStart, type KeyState } from "@/keys/router";
-import { addKey, addProvider, deleteKey, deleteProvider, setProviderModel, syncKey, toggleKey } from "./actions";
+import { canDecrypt } from "@/keys/crypto";
+import { addKey, addProvider, deleteKey, deleteProvider, resetUsage, setProviderModel, syncKey, toggleKey } from "./actions";
 import { ConfirmButton } from "./confirm-button";
 
 const UNIT: Record<string, string> = { requests: "запитів", credits: "кредитів", tokens: "токенів", usd: "$" };
@@ -43,7 +44,7 @@ function QuotaMeter({ k, now }: { k: ApiKey; now: Date }) {
         role="meter"
         aria-valuemin={0}
         aria-valuemax={k.quotaLimit}
-        aria-valuenow={used}
+        aria-valuenow={Math.min(used, k.quotaLimit)}
         aria-label={`Використано ${amount(used, k.quotaUnit)} з ${amount(k.quotaLimit, k.quotaUnit)}`}
         title={`Використано ${amount(used, k.quotaUnit)} з ${amount(k.quotaLimit, k.quotaUnit)} (${Math.round(share * 100)}%)`}
       >
@@ -59,6 +60,10 @@ function QuotaMeter({ k, now }: { k: ApiKey; now: Date }) {
     </div>
   );
 }
+
+/** «Увімкнути» для вимкнених/недійсних, «Зняти паузу» для ключів на паузі. */
+const toggleLabel = (k: ApiKey, state: KeyState) =>
+  k.status !== "active" ? "Увімкнути" : state === "cooldown" ? "Зняти паузу" : "Вимкнути";
 
 function KeyTable({ rows, now }: { rows: { key: ApiKey; provider: Provider }[]; now: Date }) {
   if (rows.length === 0) return <div className="empty">Ключів ще немає — додайте перший у формі нижче.</div>;
@@ -94,15 +99,21 @@ function KeyTable({ rows, now }: { rows: { key: ApiKey; provider: Provider }[]; 
                 <td>
                   <div className="actions">
                     {canSync(p.slug) && (
-                      <form action={syncKey}><input type="hidden" name="id" value={k.id} /><button className="link">Звірити</button></form>
+                      <form action={syncKey}><input type="hidden" name="id" value={k.id} /><button className="link" aria-label={`Звірити ключ ${p.name}, ${k.label}`}>Звірити</button></form>
                     )}
                     <form action={toggleKey}>
                       <input type="hidden" name="id" value={k.id} />
-                      <button className="link">{k.status === "active" ? "Вимкнути" : "Увімкнути"}</button>
+                      <button className="link" aria-label={`${toggleLabel(k, state)} ключ ${p.name}, ${k.label}`}>{toggleLabel(k, state)}</button>
                     </form>
+                    {k.quotaUsed > 0 && !canSync(p.slug) && (
+                      <form action={resetUsage}>
+                        <input type="hidden" name="id" value={k.id} />
+                        <button className="link" aria-label={`Скинути лічильник ключа ${p.name}, ${k.label}`}>Скинути лічильник</button>
+                      </form>
+                    )}
                     <form action={deleteKey}>
                       <input type="hidden" name="id" value={k.id} />
-                      <ConfirmButton question={`Видалити ключ «${k.label}»?`}>Видалити</ConfirmButton>
+                      <ConfirmButton question={`Видалити ключ «${k.label}»?`} label={`Видалити ключ ${p.name}, ${k.label}`}>Видалити</ConfirmButton>
                     </form>
                   </div>
                 </td>
@@ -140,6 +151,7 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
       .orderBy(asc(providers.name)),
   ]);
 
+  const broken = keyRows.filter((r) => !canDecrypt(r.key.secretEnc)).length;
   const scrapers = keyRows.filter((r) => r.provider.kind === "scraper");
   const llms = keyRows.filter((r) => r.provider.kind === "llm");
   const llmProviders = allProviders.filter((p) => p.kind === "llm");
@@ -150,6 +162,12 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
       <h1>Ключі та ліміти</h1>
       <p className="sub">Система сама обирає ключ із найбільшим залишком і перемикається, коли провайдер відмовляє.</p>
       {msg && <div className="flash" role="status">{msg}</div>}
+      {broken > 0 && (
+        <div className="flash" role="alert">
+          Ключів, які не вдається розшифрувати: {broken}. Схоже, MASTER_KEY у .env відрізняється від того, з яким їх зберігали.
+          Поверніть попереднє значення або видаліть ці ключі й додайте знову.
+        </div>
+      )}
 
       <section className="card">
         <h2>Збір даних</h2>

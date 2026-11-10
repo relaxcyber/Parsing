@@ -5,6 +5,7 @@ import { decryptSecret } from "./crypto";
 
 type Quota = { limit: number | null; used: number; unit: string; period: ApiKey["quotaPeriod"] };
 type Fetch = typeof fetch;
+type Fetcher = (f: Fetch, secret: string, current: ApiKey) => Promise<Quota>;
 
 async function getJson(f: Fetch, url: string, secret: string): Promise<any> {
   const res = await f(url, { headers: { Authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(15_000) });
@@ -15,20 +16,21 @@ async function getJson(f: Fetch, url: string, secret: string): Promise<any> {
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 
 /** Провайдери, які самі повідомляють реальний залишок. Решта рахується локально. */
-const FETCHERS: Record<string, (f: Fetch, secret: string) => Promise<Quota>> = {
+const FETCHERS: Record<string, Fetcher> = {
   async apify(f, secret) {
     const { data } = await getJson(f, "https://api.apify.com/v2/users/me/limits", secret);
     return { limit: num(data?.limits?.maxMonthlyUsageUsd), used: num(data?.current?.monthlyUsageUsd) ?? 0, unit: "usd", period: "month" };
   },
-  async firecrawl(f, secret) {
+  async firecrawl(f, secret, current) {
     const { data } = await getJson(f, "https://api.firecrawl.dev/v1/team/credit-usage", secret);
     const remaining = num(data?.remaining_credits);
     if (remaining == null) throw new Error("Firecrawl не повернув remaining_credits");
     const plan = num(data?.plan_credits);
-    // Без відомого розміру плану показуємо залишок як ліміт із нульовим використанням.
-    return plan != null && plan >= remaining
-      ? { limit: plan, used: plan - remaining, unit: "credits", period: "month" }
-      : { limit: remaining, used: 0, unit: "credits", period: "none" };
+    // Firecrawl віддає лише залишок (він буває більшим за план через бонуси). Ліміт беремо
+    // з плану, інакше — заданий вручну, інакше — сам залишок; період користувача не чіпаємо.
+    const manual = current.quotaUnit === "credits" ? current.quotaLimit : null;
+    const limit = plan != null && plan >= remaining ? plan : manual != null && manual >= remaining ? manual : remaining;
+    return { limit, used: limit - remaining, unit: "credits", period: current.quotaPeriod };
   },
   async openrouter(f, secret) {
     const { data } = await getJson(f, "https://openrouter.ai/api/v1/key", secret);
@@ -50,18 +52,19 @@ export async function syncKeyQuota(db: Db, keyId: number, f: Fetch = fetch): Pro
 
   const now = new Date();
   try {
-    const q = await fetcher(f, decryptSecret(row.key.secretEnc));
+    const q = await fetcher(f, decryptSecret(row.key.secretEnc), row.key);
     await db
       .update(apiKeys)
       .set({
         quotaLimit: q.limit, quotaUsed: q.used, quotaUnit: q.unit, quotaPeriod: q.period,
-        periodStartedAt: now, lastSyncedAt: now, lastError: null,
+        // Провайдер підтвердив стан ключа — локальна пауза більше не потрібна.
+        periodStartedAt: now, lastSyncedAt: now, lastError: null, cooldownUntil: null,
         status: row.key.status === "invalid" ? "active" : row.key.status,
       })
       .where(eq(apiKeys.id, keyId));
     return { ok: true, message: "Синхронізовано" };
   } catch (e: any) {
-    const invalid = e?.status === 401 || e?.status === 403;
+    const invalid = e?.status === 401;
     await db
       .update(apiKeys)
       .set({ lastError: `Синхронізація: ${e?.message ?? e}`, ...(invalid ? { status: "invalid" as const } : {}) })

@@ -10,24 +10,26 @@ export const KINDS = ["post", "comment", "profile", "article", "video"] as const
 export const VIA = ["local", "scrapling", "scrapling-stealth", "reddit-api", "firecrawl", "apify"] as const;
 
 const count = z.number().nonnegative().optional();
+/** Лише http(s): javascript:, file:, data: не мають потрапити у вітрину чи експорт. */
+export const httpUrl = z.url({ protocol: /^https?$/ });
 
 export const AuthorSchema = z.object({
   id: z.string().optional(),
   username: z.string().optional(),
   displayName: z.string().optional(),
-  url: z.url().optional(),
-  avatarUrl: z.url().optional(),
+  url: httpUrl.optional(),
+  avatarUrl: httpUrl.optional(),
   bio: z.string().optional(),
   followers: count,
   /** Посилання з профілю (link-in-bio) — джерело контактів. */
-  links: z.array(z.url()).optional(),
+  links: z.array(httpUrl).optional(),
   verified: z.boolean().optional(),
 });
 
 export const MediaSchema = z.object({
   type: z.enum(["image", "video", "audio"]),
-  url: z.url(),
-  thumbnailUrl: z.url().optional(),
+  url: httpUrl,
+  thumbnailUrl: httpUrl.optional(),
   width: z.number().positive().optional(),
   height: z.number().positive().optional(),
   durationSec: z.number().nonnegative().optional(),
@@ -38,7 +40,7 @@ export const ContentItemSchema = z.object({
   id: z.string().min(1),
   source: z.enum(SOURCES),
   kind: z.enum(KINDS),
-  url: z.url(),
+  url: httpUrl,
   author: AuthorSchema.nullable().default(null),
   title: z.string().optional(),
   text: z.string().optional(),

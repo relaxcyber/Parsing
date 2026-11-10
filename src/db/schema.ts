@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean, doublePrecision, index, integer, jsonb, pgEnum, pgTable, serial, text, timestamp, uniqueIndex,
 } from "drizzle-orm/pg-core";
@@ -32,6 +33,8 @@ export const apiKeys = pgTable(
     label: text("label").notNull(),
     secretEnc: text("secret_enc").notNull(),
     secretTail: text("secret_tail").notNull(),
+    /** HMAC секрету — щоб ловити дублікати без розшифрування. */
+    fingerprint: text("fingerprint"),
     status: keyStatus("status").notNull().default("active"),
     /** null — ліміт невідомий / не обмежений. */
     quotaLimit: doublePrecision("quota_limit"),
@@ -45,7 +48,10 @@ export const apiKeys = pgTable(
     lastError: text("last_error"),
     createdAt: ts("created_at").notNull().defaultNow(),
   },
-  (t) => [index("api_keys_provider_idx").on(t.providerId)],
+  (t) => [
+    index("api_keys_provider_idx").on(t.providerId),
+    uniqueIndex("api_keys_fingerprint_idx").on(t.providerId, t.fingerprint),
+  ],
 ).enableRLS();
 
 export const usageEvents = pgTable(
@@ -72,13 +78,42 @@ export const contentItems = pgTable(
     url: text("url").notNull(),
     authorUsername: text("author_username"),
     data: jsonb("data").$type<ContentItem>().notNull(),
+    /** Сира відповідь джерела: щоб не платити вдруге, якщо знадобиться поле, якого немає в контракті. */
+    raw: jsonb("raw"),
+    firstSeenAt: ts("first_seen_at").notNull().defaultNow(),
     fetchedAt: ts("fetched_at").notNull().defaultNow(),
   },
   (t) => [
     uniqueIndex("content_items_source_ext_idx").on(t.source, t.externalId),
     index("content_items_author_idx").on(t.source, t.authorUsername),
+    index("content_items_fetched_idx").on(t.fetchedAt),
   ],
 ).enableRLS();
+
+/** Журнал зборів: кеш за ціллю, захист від подвійного запуску, історія. */
+export const collectRuns = pgTable(
+  "collect_runs",
+  {
+    id: serial("id").primaryKey(),
+    targetKey: text("target_key").notNull(),
+    status: text("status").$type<"running" | "done" | "failed">().notNull().default("running"),
+    itemIds: jsonb("item_ids").$type<number[]>().notNull().default([]),
+    skipped: integer("skipped").notNull().default(0),
+    error: text("error"),
+    startedAt: ts("started_at").notNull().defaultNow(),
+    finishedAt: ts("finished_at"),
+  },
+  (t) => [
+    index("collect_runs_target_idx").on(t.targetKey, t.startedAt),
+    uniqueIndex("collect_runs_running_idx").on(t.targetKey).where(sql`${t.status} = 'running'`),
+  ],
+).enableRLS();
+
+export const sessions = pgTable("sessions", {
+  tokenHash: text("token_hash").primaryKey(),
+  expiresAt: ts("expires_at").notNull(),
+  createdAt: ts("created_at").notNull().defaultNow(),
+}).enableRLS();
 
 export type Provider = typeof providers.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;

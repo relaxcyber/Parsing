@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { apiKeys, usageEvents } from "@/db/schema";
+import { apiKeys, providers, usageEvents } from "@/db/schema";
 import { decryptSecret, encryptSecret } from "@/keys/crypto";
 import { syncKeyQuota } from "@/keys/quota-sync";
 import { acquireKey, keyState, NoKeyAvailableError, ProviderHttpError, reportResult, withKey } from "@/keys/router";
@@ -122,6 +122,57 @@ describe("contract", () => {
     const base = { id: "1", kind: "post", fetchedAt: new Date(), via: "local" };
     expect(() => ContentItemSchema.parse({ ...base, source: "myspace", url: "https://a.b" })).toThrow();
     expect(() => ContentItemSchema.parse({ ...base, source: "web", url: "not a url" })).toThrow();
+  });
+});
+
+describe("review fixes", () => {
+  it("counts every one of 20 parallel reports", async () => {
+    const db = await testDb();
+    const k = await addTestKey(db, "groq", "K", { quotaLimit: 1000, quotaPeriod: "day" });
+    await Promise.all(Array.from({ length: 20 }, () => reportResult(db, k.id, { ok: true })));
+    expect((await getKey(db, k.id)).quotaUsed).toBe(20);
+    expect(await db.select().from(usageEvents)).toHaveLength(20);
+  });
+
+  it("spreads parallel acquisitions across equally free keys", async () => {
+    const db = await testDb();
+    for (const name of ["A", "B", "C"]) await addTestKey(db, "apify", name, { quotaLimit: 5, quotaUnit: "usd" });
+    const got = await Promise.all(Array.from({ length: 9 }, () => acquireKey(db, "apify")));
+    const counts = got.reduce<Record<string, number>>((m, k) => ({ ...m, [k.secret]: (m[k.secret] ?? 0) + 1 }), {});
+    expect(counts).toEqual({ A: 3, B: 3, C: 3 });
+  });
+
+  it("pauses a key on 403 instead of marking it invalid, and waits for the next period on 402", async () => {
+    const db = await testDb();
+    const a = await addTestKey(db, "firecrawl", "A");
+    const now = new Date("2026-03-10T12:00:00Z");
+    await reportResult(db, a.id, { ok: false, httpStatus: 403, units: 0, now });
+    let after = await getKey(db, a.id);
+    expect(after.status).toBe("active");
+    expect(after.cooldownUntil.toISOString()).toBe("2026-03-10T12:10:00.000Z");
+    await reportResult(db, a.id, { ok: false, httpStatus: 402, units: 0, now });
+    after = await getKey(db, a.id);
+    expect(after.cooldownUntil.toISOString()).toBe("2026-04-01T00:00:00.000Z");
+  });
+
+  it("clears the pause after a successful sync and keeps a manual Firecrawl limit and period", async () => {
+    const db = await testDb();
+    const k = await addTestKey(db, "firecrawl", "fc", {
+      quotaLimit: 1000, quotaUsed: 100, quotaUnit: "credits", quotaPeriod: "month", cooldownUntil: new Date(Date.now() + 86400_000),
+    });
+    const fake = (async () => Response.json({ success: true, data: { remaining_credits: 900 } })) as unknown as typeof fetch;
+    expect((await syncKeyQuota(db, k.id, fake)).ok).toBe(true);
+    const after = await getKey(db, k.id);
+    expect([after.quotaLimit, after.quotaUsed, after.quotaPeriod, after.cooldownUntil]).toEqual([1000, 100, "month", null]);
+  });
+
+  it("keeps one row when the same key is added twice at once", async () => {
+    const { addKey } = await import("@/keys/store");
+    const db = await testDb();
+    const [p] = await db.select().from(providers).where(eq(providers.slug, "groq"));
+    const results = await Promise.all([1, 2].map(() => addKey(db, { providerId: p.id, label: "x", secret: "gsk_same_secret_value" })));
+    expect(results.map((r) => r.status).sort()).toEqual(["added", "duplicate"]);
+    expect(await db.select().from(apiKeys)).toHaveLength(1);
   });
 });
 

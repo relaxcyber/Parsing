@@ -26,7 +26,9 @@ export async function runCollect(form: FormData) {
   let msg: string;
   try {
     const r = await collect(getDb(), target, { fresh: form.get("fresh") === "on" });
-    msg = [`Зібрано елементів: ${r.items.length}${r.cached ? " (з кешу, до 24 год)" : ""}`, ...r.notes].join(". ");
+    const cached = r.cachedAt ? ` (з кешу від ${new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }).format(r.cachedAt)})` : "";
+    const skipped = r.skipped.length ? [`Пропущено: ${r.skipped.length} (${r.skipped.slice(0, 2).join("; ")})`] : [];
+    msg = [`Зібрано елементів: ${r.items.length}${cached}`, ...r.notes, ...skipped].join(". ");
   } catch (e) {
     msg = `Не вдалося зібрати: ${e instanceof Error ? e.message : e}`;
   }

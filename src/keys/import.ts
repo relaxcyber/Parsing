@@ -6,7 +6,7 @@
  */
 import { readFileSync } from "node:fs";
 import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
+import { connect } from "@/db/connection";
 import * as schema from "@/db/schema";
 import type { Db } from "@/db/client";
 import { addKey } from "./store";
@@ -43,7 +43,7 @@ if (process.argv[1]?.endsWith("import.ts")) {
   const file = process.argv[2];
   if (!file) throw new Error("Вкажіть файл: npm run keys:import -- keys.txt");
   if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL не задано");
-  const sql = postgres(process.env.DATABASE_URL, { max: 1, prepare: !process.env.DATABASE_URL.includes(":6543") });
+  const sql = connect(process.env.DATABASE_URL, 1);
   const lines = await importKeys(drizzle(sql, { schema }) as unknown as Db, readFileSync(file, "utf8"));
   console.log(lines.join("\n") || "Файл порожній");
   await sql.end();

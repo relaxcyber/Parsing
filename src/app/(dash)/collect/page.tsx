@@ -43,13 +43,13 @@ export default async function CollectPage({ searchParams }: { searchParams: Prom
           <label>Адреса, @профіль або #хештег<input name="value" required placeholder="https://… / @name / #ugccreator" /></label>
           <label>Скільки дописів (для хештега)<input name="limit" type="number" min="1" max="200" defaultValue={20} /></label>
           <label style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
-            <input type="checkbox" name="fresh" /> Не брати з кешу
+            <input type="checkbox" name="fresh" /> Зібрати заново (без кешу)
           </label>
           <SubmitButton />
         </form>
         <p className="muted" style={{ margin: "12px 0 0" }}>
           Сторінки спершу завантажуються локально й безкоштовно: прямий запит, потім Scrapling (обхід захисту від ботів).
-          Firecrawl витрачає кредит лише коли жоден локальний спосіб не впорався. Instagram іде через Apify і може тривати до кількох хвилин.
+          Firecrawl витрачає кредит лише коли жоден локальний спосіб не впорався. Instagram іде через Apify і може тривати до кількох хвилин. Повторний запит бере збережене: сторінки й профілі — 24 год, хештеги — 6 год.
           {" "}{scrapling ? "Scrapling встановлено." : "Scrapling не встановлено — захищені сайти одразу підуть у Firecrawl (див. README)."}
         </p>
       </section>

@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "node:crypto";
 
 function masterKey(): Buffer {
   const raw = process.env.MASTER_KEY;
@@ -24,4 +24,18 @@ export function decryptSecret(enc: string): string {
 
 export function secretTail(plain: string): string {
   return plain.length > 8 ? plain.slice(-4) : "";
+}
+
+/** Детермінований відбиток секрету для пошуку дублікатів. */
+export function fingerprint(plain: string): string {
+  return createHmac("sha256", masterKey()).update(`fp:${plain}`).digest("base64url");
+}
+
+export function canDecrypt(enc: string): boolean {
+  try {
+    decryptSecret(enc);
+    return true;
+  } catch {
+    return false;
+  }
 }

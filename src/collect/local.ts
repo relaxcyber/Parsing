@@ -1,21 +1,45 @@
 import * as cheerio from "cheerio";
 import type { ContentItemInput } from "@/core/contract";
+import { assertPublicUrl } from "./net";
 
 /** Локальний спосіб не впорався (захист, JS-рендеринг) — каскад іде далі. */
-export class LocalMiss extends Error {}
+export class LocalMiss extends Error {
+  /** definitive: сторінки справді немає — платні способи пробувати марно. */
+  constructor(message: string, public definitive = false) {
+    super(message);
+  }
+}
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const CHALLENGE = /Just a moment\.\.\.|cf-challenge|challenge-platform|Attention Required!|captcha-delivery|Access Denied/i;
 const MAX_TEXT = 50_000;
+const MAX_BYTES = 5 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
+const BLOCKS = "p, h1, h2, h3, h4, h5, h6, li, blockquote, pre, div, section, tr, dt, dd, figcaption";
 
 const absolute = (href: string | undefined, base: string) => {
   try {
-    return href ? new URL(href, base).toString() : undefined;
+    const u = href ? new URL(href, base) : undefined;
+    return u && /^https?:$/.test(u.protocol) ? u.toString() : undefined;
   } catch {
     return undefined;
   }
 };
+
+/** Текст із межами абзаців: cheerio сам склеює сусідні блоки без пробілів. */
+function blockText($: cheerio.CheerioAPI, root: cheerio.Cheerio<any>): string {
+  root.find("br").replaceWith("\n");
+  root.find(BLOCKS).each((_, el) => {
+    $(el).prepend("\n\n").append("\n\n");
+  });
+  return root
+    .text()
+    .replace(/[ \t\r\f\v ]+/g, " ")
+    .replace(/ ?\n ?/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 export function extractHtml(html: string, url: string, now = new Date()): ContentItemInput {
   const $ = cheerio.load(html);
@@ -30,7 +54,7 @@ export function extractHtml(html: string, url: string, now = new Date()): Conten
 
   $("script, style, noscript, svg, nav, header, footer, aside, form, iframe").remove();
   const root = $("article").first().length ? $("article").first() : $("main").first().length ? $("main").first() : $("body");
-  const text = root.text().replace(/[ \t\r\f\v]+/g, " ").replace(/\s*\n\s*/g, "\n").trim().slice(0, MAX_TEXT);
+  const text = blockText($, root).slice(0, MAX_TEXT);
 
   const authorName = meta("author", "article:author");
   const published = meta("article:published_time", "og:article:published_time", "date");
@@ -48,27 +72,75 @@ export function extractHtml(html: string, url: string, now = new Date()): Conten
 
 /** Спільна для всіх локальних способів перевірка: це справжній вміст, а не заглушка захисту? */
 export function checkedItem(html: string, url: string, via: ContentItemInput["via"]): ContentItemInput {
-  if (CHALLENGE.test(html.slice(0, 20_000))) throw new LocalMiss("сторінка захисту від ботів");
   const item = extractHtml(html, url);
-  // Майже порожній текст при великому HTML — сторінка малюється скриптами.
-  if ((item.text?.length ?? 0) < 200 && html.length > 5_000) throw new LocalMiss("вміст рендериться скриптами");
+  const textLen = item.text?.length ?? 0;
+  const title = html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] ?? "";
+  // Слова на кшталт «Access Denied» у довгій статті — це тема статті, а не заглушка.
+  if (CHALLENGE.test(title) || (textLen < 1500 && CHALLENGE.test(html.slice(0, 20_000)))) {
+    throw new LocalMiss("сторінка захисту від ботів");
+  }
+  // Майже порожній текст при великому HTML зі скриптами — сторінка малюється в браузері.
+  const scripts = html.match(/<script\b/gi)?.length ?? 0;
+  if (textLen < 200 && html.length > 5_000 && scripts >= 3) throw new LocalMiss("вміст рендериться скриптами");
   return { ...item, via };
 }
 
-export async function fetchLocal(url: string): Promise<ContentItemInput> {
-  let res: Response;
-  try {
-    res = await fetch(url, {
-      headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "accept-language": "en-US,en;q=0.9,uk;q=0.8" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(20_000),
-    });
-  } catch (e) {
-    throw new LocalMiss(`мережа: ${e instanceof Error ? e.message : e}`);
+/** Читає тіло не більше MAX_BYTES і декодує з урахуванням кодування сторінки. */
+async function readBody(res: Response): Promise<string> {
+  const declared = Number(res.headers.get("content-length"));
+  if (declared > MAX_BYTES * 4) throw new LocalMiss("сторінка завелика", true);
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  const reader = res.body?.getReader();
+  if (reader) {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      size += value.length;
+      if (size >= MAX_BYTES) {
+        await reader.cancel().catch(() => {});
+        break;
+      }
+    }
   }
+  const bytes = Buffer.concat(chunks).subarray(0, MAX_BYTES);
+  const head = bytes.subarray(0, 2048).toString("latin1");
+  const charset =
+    res.headers.get("content-type")?.match(/charset=["']?([\w-]+)/i)?.[1] ??
+    head.match(/<meta[^>]+charset=["']?\s*([\w-]+)/i)?.[1] ??
+    "utf-8";
+  try {
+    return new TextDecoder(charset).decode(bytes);
+  } catch {
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+}
+
+export async function fetchLocal(url: string): Promise<ContentItemInput> {
+  let current = url;
+  let res: Response | undefined;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    await assertPublicUrl(current); // кожен перехід перевіряємо заново
+    try {
+      res = await fetch(current, {
+        headers: { "user-agent": UA, accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "accept-language": "en-US,en;q=0.9,uk;q=0.8" },
+        redirect: "manual",
+        signal: AbortSignal.timeout(20_000),
+      });
+    } catch (e) {
+      throw new LocalMiss(`мережа: ${e instanceof Error ? e.message : e}`);
+    }
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    if (!location) break;
+    await res.body?.cancel().catch(() => {});
+    current = new URL(location, current).toString();
+    if (hop === MAX_REDIRECTS) throw new LocalMiss("забагато переадресацій", true);
+  }
+  if (!res) throw new LocalMiss("мережа: немає відповіді");
+  if (res.status === 404 || res.status === 410) throw new LocalMiss(`HTTP ${res.status} — сторінки не існує`, true);
   if (!res.ok) throw new LocalMiss(`HTTP ${res.status}`);
   const type = res.headers.get("content-type") ?? "";
-  if (!/html|xml/.test(type)) throw new LocalMiss(`не HTML (${type || "невідомий тип"})`);
-  const html = await res.text();
-  return checkedItem(html, url, "local");
+  if (type && !/html|xml/.test(type)) throw new LocalMiss(`не HTML (${type})`, true);
+  return checkedItem(await readBody(res), current, "local");
 }

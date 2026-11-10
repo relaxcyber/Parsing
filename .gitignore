@@ -1,7 +1,7 @@
 node_modules
 .next
-.env
-.env.local
+.env*
+!.env.example
 data/
 *.tsbuildinfo
 next-env.d.ts

@@ -54,6 +54,7 @@ export async function fetchScrapling(url: string, mode: "http" | "stealth"): Pro
     if (r.code === "ENOENT") throw new ScraplingMissing("Scrapling не встановлено");
     if (r.code === "TIMEOUT") throw new LocalMiss("час очікування вичерпано");
     const status = Number(r.output.match(/Fetched \((\d{3})\)/)?.[1]);
+    if (status === 404 || status === 410) throw new LocalMiss(`HTTP ${status} — сторінки не існує`, true);
     if (status >= 400) throw new LocalMiss(`HTTP ${status}`);
     const html = await readFile(out, "utf8").catch(() => "");
     if (!html.trim()) throw new LocalMiss(r.code === 0 ? "порожня відповідь" : `помилка (${r.output.trim().split("\n").at(-1)?.slice(0, 160)})`);

@@ -1,11 +1,9 @@
 import { ProviderHttpError } from "@/keys/router";
 
-/** POST JSON із ключем; не-2xx перетворює на ProviderHttpError, щоб роутер міг змінити ключ. */
-export async function postJson(url: string, secret: string, body: unknown, timeoutMs: number): Promise<any> {
+async function request(url: string, secret: string, init: RequestInit, timeoutMs: number): Promise<any> {
   const res = await fetch(url, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${secret}`, "content-type": "application/json" },
-    body: JSON.stringify(body),
+    ...init,
+    headers: { Authorization: `Bearer ${secret}`, ...init.headers },
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) {
@@ -15,3 +13,9 @@ export async function postJson(url: string, secret: string, body: unknown, timeo
   }
   return res.json();
 }
+
+/** Запити з ключем; не-2xx стає ProviderHttpError, щоб роутер міг змінити ключ. */
+export const postJson = (url: string, secret: string, body: unknown, timeoutMs: number) =>
+  request(url, secret, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }, timeoutMs);
+
+export const getJson = (url: string, secret: string, timeoutMs: number) => request(url, secret, {}, timeoutMs);
