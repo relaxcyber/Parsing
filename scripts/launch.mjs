@@ -28,9 +28,9 @@ async function health() {
   }
 }
 
-const run = (args) => {
+const run = (args, hint = "") => {
   const r = spawnSync("npm", args, { cwd: root, stdio: "inherit", shell: win });
-  if (r.status !== 0) fail(`Команда «npm ${args.join(" ")}» завершилася з помилкою.`);
+  if (r.status !== 0) fail(`Команда «npm ${args.join(" ")}» завершилася з помилкою.${hint}`);
 };
 
 /** Версія коду: коміт git, інакше — версія з package.json. */
@@ -86,7 +86,7 @@ if (!state || stale) {
     for (let i = 0; i < 20 && (await health()); i++) await new Promise((r) => setTimeout(r, 500));
   }
   if (!existsSync(path.join(root, "node_modules")) || stale) run(["install"]);
-  run(["run", "db:migrate"]);
+  run(["run", "db:migrate"], "\nНайчастіша причина — база даних недоступна: перевірте DATABASE_URL у .env,\nа для локальної бази виконайте «docker compose up -d db».");
   if (stale) {
     run(["run", "build"]);
     writeFileSync(builtFile, version);

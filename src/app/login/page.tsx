@@ -22,7 +22,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
       {locked > 0 ? (
         <div className="flash" role="alert">Забагато невдалих спроб. Спробуйте знову через {wait(locked)}.</div>
       ) : (
-        error && <div className="flash" role="alert">Невірний пароль</div>
+        error && <div className="flash" role="alert">Неправильний пароль</div>
       )}
       <form action={signIn}>
         <label>

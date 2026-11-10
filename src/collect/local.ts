@@ -76,12 +76,17 @@ export function checkedItem(html: string, url: string, via: ContentItemInput["vi
   const textLen = item.text?.length ?? 0;
   const title = html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] ?? "";
   // Слова на кшталт «Access Denied» у довгій статті — це тема статті, а не заглушка.
-  if (CHALLENGE.test(title) || (textLen < 1500 && CHALLENGE.test(html.slice(0, 20_000)))) {
+  // У короткій сторінці шукаємо по всьому документу: скрипт перевірки буває глибоко після стилів.
+  if (CHALLENGE.test(title) || (textLen < 1500 && CHALLENGE.test(html))) {
     throw new LocalMiss("сторінка захисту від ботів");
   }
-  // Майже порожній текст при великому HTML зі скриптами — сторінка малюється в браузері.
+  // Сторінка малюється в браузері: тексту майже немає, а розмітки без стилів, SVG і вбудованих
+  // даних (JSON-LD) багато — або тексту немає зовсім, а скрипти є (компактний SPA).
   const scripts = html.match(/<script\b/gi)?.length ?? 0;
-  if (textLen < 200 && html.length > 5_000 && scripts >= 3) throw new LocalMiss("вміст рендериться скриптами");
+  const markup = html.replace(/<(style|svg)\b[\s\S]*?<\/\1>|<script\b[^>]*type=["']application\/(ld\+)?json["'][\s\S]*?<\/script>/gi, "").length;
+  if ((textLen < 200 && markup > 5_000 && scripts >= 3) || (textLen < 50 && scripts >= 1)) {
+    throw new LocalMiss("вміст рендериться скриптами");
+  }
   return { ...item, via };
 }
 

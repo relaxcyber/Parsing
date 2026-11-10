@@ -9,7 +9,7 @@ import { AlreadyRunningError, collect, saveItems } from "@/collect";
 import { assertPublicUrl, isPrivateAddress, UnsafeUrlError } from "@/collect/net";
 import { mapFirecrawl } from "@/collect/firecrawl";
 import { mapPost, mapProfile, runCostUsd } from "@/collect/instagram";
-import { extractHtml } from "@/collect/local";
+import { checkedItem, extractHtml, LocalMiss } from "@/collect/local";
 import { collectRuns, contentItems, usageEvents } from "@/db/schema";
 import { addTestKey, testDb } from "./helpers";
 
@@ -340,6 +340,12 @@ describe("page decoding", () => {
     const r = await collect(db, { type: "url", url: "https://cp1251.example/" });
     expect(r.items[0].title).toBe("Тест");
     expect(r.items[0].text).toContain("Привіт, це кирилиця.");
+  });
+
+  it("detects a compact script-only page and ignores inline SVG weight on a short real page", () => {
+    expect(() => checkedItem(`<html><body><div id="root"></div><script src="/app.js"></script></body></html>`, "https://spa.example/", "local")).toThrow(LocalMiss);
+    const shortNote = html(`<main><p>Коротка справжня нотатка без скриптів.</p><svg>${"<path d='M0 0'/>".repeat(600)}</svg></main>`);
+    expect(checkedItem(shortNote, "https://note.example/", "local").text).toContain("Коротка справжня");
   });
 
   it("does not mistake an article that mentions 'Access Denied' for a bot wall", async () => {
