@@ -22,6 +22,7 @@ const NEGATIVE: Signal[] = [
   { pattern: /\b(giveaway|sweepstake)\b|розіграш|розыгрыш/i, weight: 2, reason: "розіграш" },
   { pattern: /\b(shop now|order now|free shipping|wholesale|we ship|in stock|dm to order)\b|доставка по/i, weight: 3, reason: "схоже на магазин" },
   { pattern: /\b(agency|we (are|help|create)|our (team|clients|services))\b|агенці|агентств/i, weight: 3, reason: "схоже на агенцію" },
+  { pattern: /\b(marketplace|platform for|hire (ugc )?creators|verified (ugc )?creators|brands?\s*[×x&]\s*creators|for brands and creators|start free)\b/i, weight: 4, reason: "схоже на платформу-посередника" },
 ];
 
 const LINK_HUBS = /(beacons\.ai|stan\.store|linktr\.ee|canva\.(com|site)|carrd\.co|bio\.site|taplink\.cc|msha\.ke|hoo\.be|komi\.io|later\.com)/i;

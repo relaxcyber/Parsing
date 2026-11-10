@@ -25,6 +25,10 @@ describe("text scoring", () => {
     expect(shop.reasons).toContain("мінус: схоже на магазин");
     expect(scoreCandidate({ keywords: [], stopWords: ["giveaway"], texts: ["ugc creator, giveaway inside"] })).toMatchObject({ fit: null, blocked: true });
   });
+  it("flags creator marketplaces as not an individual author", () => {
+    const s = scoreCandidate({ keywords: [], stopWords: [], texts: [], bio: "Real influencers. Brands × verified UGC creators. Start free" });
+    expect([s.negative, s.reasons.at(-1)]).toEqual([true, "мінус: схоже на платформу-посередника"]);
+  });
   it("matches Cyrillic niche words and whole words only", () => {
     expect(scoreCandidate({ keywords: ["догляд"], stopWords: [], texts: ["Мій догляд за шкірою"] }).fit).toBe(10);
     expect(scoreCandidate({ keywords: ["art"], stopWords: [], texts: ["a smart start"] }).fit).toBe(0);

@@ -170,6 +170,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
       if (search.minFollowers != null && c.followers != null && c.followers < search.minFollowers) reject.push(`замало підписників (${c.followers})`);
       if (search.maxFollowers != null && c.followers != null && c.followers > search.maxFollowers) reject.push(`забагато підписників (${c.followers})`);
       if (final.blocked) reject.push("відсіяно стоп-словом");
+      if (final.negative) reject.push("не окремий автор (магазин, агенція чи платформа)");
       if (final.readiness === 0) reject.push("немає ознак готовності до співпраці");
       const ok = reject.length === 0;
       if (ok) qualified++;
