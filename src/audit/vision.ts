@@ -5,6 +5,7 @@ import { z } from "zod";
 import { assertPublicUrl } from "@/collect/net";
 import type { Db } from "@/db/client";
 import { chatJson } from "@/llm/client";
+import { extractFrames } from "./frames";
 
 /** Схема відповіді моделі — за специфікацією, плюс прапорець про дітей у кадрі (COPPA / GDPR-K). */
 export const VisionAuditSchema = z.object({
@@ -36,7 +37,7 @@ export function qualityIndex(a: VisionAudit): number {
 }
 
 const PROMPT = `You are a strict art director screening UGC creators for paid product ads.
-The image is a 2x2 collage of this creator's recent posts. Judge only what is visible.
+The image is a 2x2 collage of frames from this creator's recent posts. Judge only what is visible.
 Return ONLY a JSON object with exactly these keys:
 - production_tier: "CINEMA_MIRRORLESS" | "FLAGSHIP_SMARTPHONE" | "MIDRANGE_SMARTPHONE" | "LOWEND_DEGRADED" (sharpness, noise, compression)
 - production_confidence: 0..1
@@ -77,19 +78,42 @@ export async function buildCollage(images: Buffer[]): Promise<Buffer> {
 
 export const collagePath = (creatorId: number) => path.join(process.cwd(), "data", "collages", `${creatorId}.jpg`);
 
-export type AuditResult = { audit: VisionAudit; quality: number; frames: number } | { skipped: string };
+export type AuditResult = { audit: VisionAudit; quality: number; frames: number; fromVideo: number } | { skipped: string };
+export type AuditMedia = { covers: string[]; videos?: string[] };
 
-/** Завантажує кадри, складає колаж, зберігає його для вітрини й отримує оцінку моделі. */
-export async function auditCreator(db: Db, creatorId: number, imageUrls: string[]): Promise<AuditResult> {
+async function validImage(buf: Buffer | null): Promise<Buffer | null> {
+  if (!buf) return null;
+  try {
+    await sharp(buf).metadata(); // відсіюємо биті файли до складання колажу
+    return buf;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Збирає до чотирьох кадрів: три з тіла ролика плюс одна обкладинка (як вимагає специфікація),
+ * а якщо відео недоступне — обкладинки дописів. Складає колаж, зберігає його для вітрини
+ * й отримує оцінку моделі.
+ */
+export async function auditCreator(db: Db, creatorId: number, media: AuditMedia): Promise<AuditResult> {
   const images: Buffer[] = [];
-  for (const url of imageUrls.slice(0, 8)) {
+  let fromVideo = 0;
+  for (const video of (media.videos ?? []).slice(0, 2)) {
+    const frames = await extractFrames(video, 3);
+    for (const f of frames) {
+      const ok = await validImage(f);
+      if (ok && images.length < 3) {
+        images.push(ok);
+        fromVideo++;
+      }
+    }
+    if (fromVideo >= 3) break;
+  }
+  for (const url of media.covers.slice(0, 8)) {
     if (images.length >= 4) break;
-    const buf = await download(url);
-    if (!buf) continue;
-    try {
-      await sharp(buf).metadata(); // відсіюємо биті файли до складання колажу
-      images.push(buf);
-    } catch {}
+    const buf = await validImage(await download(url));
+    if (buf) images.push(buf);
   }
   if (images.length < 2) return { skipped: images.length ? "замало зображень для оцінки" : "не вдалося завантажити зображення дописів" };
 
@@ -97,11 +121,12 @@ export async function auditCreator(db: Db, creatorId: number, imageUrls: string[
   await mkdir(path.dirname(collagePath(creatorId)), { recursive: true });
   await writeFile(collagePath(creatorId), collage);
 
+  const what = fromVideo ? `${fromVideo} frame(s) taken from inside the creator's videos and ${images.length - fromVideo} post cover(s)` : `${images.length} post cover(s)`;
   const audit = await chatJson(db, VisionAuditSchema, [
     { role: "user", content: [
-      { type: "text", text: `${PROMPT}\nThe collage contains ${images.length} frame(s).` },
+      { type: "text", text: `${PROMPT}\nThe collage contains ${what}.` },
       { type: "image_url", image_url: { url: `data:image/jpeg;base64,${collage.toString("base64")}` } },
     ] },
   ], { purpose: "vision-audit" });
-  return { audit, quality: qualityIndex(audit), frames: images.length };
+  return { audit, quality: qualityIndex(audit), frames: images.length, fromVideo };
 }

@@ -2,12 +2,13 @@
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs" || !process.env.DATABASE_URL) return;
   try {
-    const [{ getDb }, { failInterruptedRuns }, search] = await Promise.all([
-      import("@/db/client"), import("@/collect"), import("@/search/pipeline"),
+    const [{ getDb }, { failInterruptedRuns }, search, scrape] = await Promise.all([
+      import("@/db/client"), import("@/collect"), import("@/search/pipeline"), import("@/scrape/jobs"),
     ]);
     await failInterruptedRuns(getDb());
     await search.requeueInterrupted(getDb());
-    search.startSearchWorker(getDb);
+    await scrape.requeueInterruptedJobs(getDb());
+    search.startSearchWorker(getDb, [scrape.runNextScrapeJob]);
   } catch (e) {
     console.error("Не вдалося запустити фонові задачі:", e);
   }

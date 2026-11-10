@@ -40,6 +40,8 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
             </select>
           </label>
           <label>Аудит візуалу для найкращих<input name="auditLimit" type="number" min="0" max="150" defaultValue={30} required /></label>
+          <label>Країни (коди через кому)<input name="countries" placeholder="US, GB" /></label>
+          <label>Мови контенту (коди)<input name="languages" placeholder="en" /></label>
           <label>
             Мова листів
             <select name="outreachLanguage" defaultValue="en">
@@ -51,7 +53,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
         <p className="muted" style={{ margin: "12px 0 0" }}>
           Вартість в Apify — приблизно ${PRICE_PER_RESULT_USD} за кожен допис і кожен профіль. Наприклад, 2 хештеги по 50 дописів і 150
           профілів — близько $0,65. Профілі, зібрані за останні 7 днів, повторно не оплачуються. Контакти зі сторінок-візиток
-          і перевірка email безкоштовні; аудит візуалу витрачає ліміт мовної моделі (0 — не робити). Пошук іде у фоні — сторінку можна закрити.
+          і перевірка email безкоштовні. Країну й мову визначаємо за непрямими ознаками: автори, у яких їх визначити не вдалося, фільтр проходять; аудит візуалу витрачає ліміт мовної моделі (0 — не робити). Пошук іде у фоні — сторінку можна закрити.
         </p>
       </section>
 

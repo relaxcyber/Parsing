@@ -6,6 +6,8 @@ import { z } from "zod";
 import { getDb } from "@/db/client";
 import { searches } from "@/db/schema";
 import { requireAuth } from "@/lib/auth";
+import { creators } from "@/db/schema";
+import { normalizeCountry } from "@/enrich/geo";
 import { suppressCreator } from "@/search/suppress";
 
 const list = (max: number) =>
@@ -23,6 +25,8 @@ const SearchForm = z.object({
   maxFollowers: optionalInt,
   outreachLanguage: z.enum(["en", "uk", "ru", "pl", "de", "es"]),
   focus: z.enum(["ugc", "affiliate"]),
+  countries: z.string().default("").transform((v) => [...new Set(v.split(/[,\s]+/).map((c) => normalizeCountry(c)).filter((c) => /^[A-Z]{2}$/.test(c)))].slice(0, 20)),
+  languages: z.string().default("").transform((v) => [...new Set(v.split(/[,\s]+/).map((c) => c.trim().toLowerCase()).filter((c) => /^[a-z]{2}$/.test(c)))].slice(0, 10)),
   auditLimit: z.coerce.number().int().min(0).max(150),
 });
 
@@ -68,5 +72,16 @@ export async function suppress(form: FormData) {
   await requireAuth();
   const searchId = z.coerce.number().int().positive().parse(form.get("searchId"));
   await suppressCreator(getDb(), id(form), "видалено вручну з дашборда");
+  redirect(`/search/${searchId}?view=${encodeURIComponent(String(form.get("view") ?? "qualified"))}`);
+}
+
+/** Ваш вердикт щодо автора: еталон, за яким калібруються пороги моделі. Повторний клік знімає позначку. */
+export async function setVerdict(form: FormData) {
+  await requireAuth();
+  const searchId = z.coerce.number().int().positive().parse(form.get("searchId"));
+  const verdict = z.enum(["yes", "no"]).parse(form.get("verdict"));
+  const db = getDb();
+  const [c] = await db.select({ v: creators.manualVerdict }).from(creators).where(eq(creators.id, id(form)));
+  if (c) await db.update(creators).set({ manualVerdict: c.v === verdict ? null : verdict }).where(eq(creators.id, id(form)));
   redirect(`/search/${searchId}?view=${encodeURIComponent(String(form.get("view") ?? "qualified"))}`);
 }

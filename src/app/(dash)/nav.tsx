@@ -6,7 +6,8 @@ import { usePathname } from "next/navigation";
 const LINKS = [
   { href: "/keys", label: "Ключі та ліміти" },
   { href: "/search", label: "Пошук креаторів" },
-  { href: "/collect", label: "Збір даних" },
+  { href: "/scrape", label: "Парсинг сайтів" },
+  { href: "/collect", label: "Разовий збір" },
 ];
 
 export function Nav() {

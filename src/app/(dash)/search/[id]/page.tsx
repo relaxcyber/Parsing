@@ -7,7 +7,8 @@ import { activityStatus } from "@/enrich/activity";
 import { classifyLinks } from "@/enrich/links";
 import { estimateCostUsd, QUALITY_LEAD } from "@/search/pipeline";
 import { ConfirmButton } from "../../keys/confirm-button";
-import { cancelSearch, deleteSearch, rerunSearch, suppress } from "../actions";
+import { calibrate } from "@/search/calibrate";
+import { cancelSearch, deleteSearch, rerunSearch, setVerdict, suppress } from "../actions";
 import { AutoRefresh } from "../auto-refresh";
 import { LANGS, STATUS } from "../labels";
 
@@ -64,6 +65,9 @@ export default async function SearchDetail({ params, searchParams }: {
   const contacts = rows.length
     ? await db.select().from(creatorContacts).where(inArray(creatorContacts.creatorId, rows.map((r) => r.creator.id)))
     : [];
+  const labeled = await db.select({ quality: creators.quality, verdict: creators.manualVerdict }).from(creators)
+    .where(sql`${creators.manualVerdict} is not null and ${creators.quality} is not null`);
+  const cal = calibrate(labeled.map((l) => ({ quality: l.quality!, verdict: l.verdict! })), QUALITY_LEAD);
   const countOf = (v: View) => counts.filter((c) => (VIEWS[v].stages as readonly string[]).includes(c.stage)).reduce((a, c) => a + c.n, 0);
   const active = s.status === "queued" || s.status === "running";
   const pct = s.progress && s.progress.total > 0 ? Math.round((s.progress.done / s.progress.total) * 100) : null;
@@ -157,6 +161,9 @@ export default async function SearchDetail({ params, searchParams }: {
                         <a href={`https://www.instagram.com/${c.username}/`} target="_blank" rel="noreferrer">@{c.username}</a>
                         {cand.lead && <div><span className="badge">готовий лід</span></div>}
                         <div className="muted">{[c.displayName, c.followers != null ? `${nf.format(c.followers)} підписників` : null].filter(Boolean).join(" · ")}</div>
+                        {(c.country || c.language) && (
+                          <div className="muted">{[c.country ? `країна: ${c.country}${(c.countryConfidence ?? 0) < 0.6 ? "?" : ""}` : null, c.language ? `мова: ${c.language}` : null].filter(Boolean).join(" · ")}</div>
+                        )}
                         {c.bio && <div className="muted" style={{ maxWidth: 240, overflowWrap: "anywhere" }}>{c.bio.length > 110 ? `${c.bio.slice(0, 110)}…` : c.bio}</div>}
                       </td>
                       <td className="num"><b>{idx(cand.score)}</b></td>
@@ -193,6 +200,18 @@ export default async function SearchDetail({ params, searchParams }: {
                       </td>
                       <td className="muted" style={{ minWidth: 200, maxWidth: 280 }}>{cand.reasons.join(" · ")}</td>
                       <td>
+                        <div className="actions" style={{ marginBottom: 6 }}>
+                          {(["yes", "no"] as const).map((v) => (
+                            <form action={setVerdict} key={v}>
+                              <input type="hidden" name="id" value={c.id} /><input type="hidden" name="searchId" value={s.id} />
+                              <input type="hidden" name="view" value={view} /><input type="hidden" name="verdict" value={v} />
+                              <button className={c.manualVerdict === v ? "chip on" : "chip"} aria-pressed={c.manualVerdict === v}
+                                aria-label={`${v === "yes" ? "Взяв би" : "Не взяв би"} @${c.username}`}>
+                                {v === "yes" ? "Взяв би" : "Ні"}
+                              </button>
+                            </form>
+                          ))}
+                        </div>
                         <form action={suppress}>
                           <input type="hidden" name="id" value={c.id} /><input type="hidden" name="searchId" value={s.id} /><input type="hidden" name="view" value={view} />
                           <ConfirmButton
@@ -211,10 +230,19 @@ export default async function SearchDetail({ params, searchParams }: {
           </div>
         )}
         <p className="muted" style={{ margin: "12px 0 0" }}>
+          <b style={{ color: "var(--ink)" }}>Калібрування.</b>{" "}
+          {cal.labeled === 0
+            ? "Позначайте авторів «Взяв би» / «Ні» — за вашими вердиктами система перевірить, чи можна довіряти оцінці якості."
+            : `Розмічено авторів з оцінкою якості: ${cal.labeled}. За порога ${cal.current.threshold} модель згодна з вами у ${cal.current.agree} з ${cal.labeled}.`}
+          {cal.labeled > 0 && !cal.best && " Для поради щодо порога потрібно щонайменше 10 вердиктів обох типів."}
+          {cal.best && cal.best.threshold !== cal.current.threshold && ` Найкращий збіг дає поріг ${cal.best.threshold}: ${cal.best.agree} з ${cal.labeled}.`}
+          {cal.best && cal.best.threshold === cal.current.threshold && " Чинний поріг — найкращий для ваших вердиктів."}
+        </p>
+        <p className="muted" style={{ margin: "12px 0 0" }}>
           Оцінка — середнє наявних індексів (0–100). «Ніша»: слова ніші в дописах і біо та роль автора. «Готовність»: email 40, допис за тиждень 30
           (за два — 15), прайс 20, портфоліо 10. «Якість»: аудит колажу дописів мовною моделлю. «Готовий лід» — активний автор з особистим email
-          і якістю від {QUALITY_LEAD}. Email перевірено на синтаксис і наявність поштового домену, але не пробним листом. «Виключити» видаляє дані
-          автора назавжди — використовуйте на запит самого автора.
+          і якістю від {QUALITY_LEAD}. Email перевірено на синтаксис і наявність поштового домену, але не пробним листом. «Залученість» нижче 0,3% при аудиторії від 5 тис. позначається
+          як можлива накрутка. «Виключити» видаляє дані автора назавжди — використовуйте на запит самого автора.
         </p>
       </section>
     </>

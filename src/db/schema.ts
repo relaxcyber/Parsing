@@ -152,6 +152,14 @@ export const creators = pgTable(
     socials: jsonb("socials").$type<Record<string, string>>().notNull().default({}),
     rates: jsonb("rates").$type<CreatorRate[]>().notNull().default([]),
     linksCheckedAt: ts("links_checked_at"),
+    /** Оцінка країни та мови за непрямими ознаками (прапорці, міста, Amazon, службові слова). */
+    country: text("country"),
+    countryConfidence: doublePrecision("country_confidence"),
+    language: text("language"),
+    /** Медіана вподобань останніх дописів до кількості підписників. */
+    erLikes: doublePrecision("er_likes"),
+    /** Ваш вердикт «взяв би / ні» — еталон для калібрування порогів моделі. */
+    manualVerdict: text("manual_verdict").$type<"yes" | "no">(),
     /** Візуальний аудит: Quality Index 0–100 і сира відповідь моделі. */
     quality: doublePrecision("quality"),
     audit: jsonb("audit").$type<Record<string, unknown>>(),
@@ -216,6 +224,9 @@ export const searches = pgTable(
     minFollowers: integer("min_followers"),
     maxFollowers: integer("max_followers"),
     outreachLanguage: text("outreach_language").notNull().default("en"),
+    /** Обмеження за країною та мовою (порожньо — без обмежень). Автори з невизначеною країною проходять. */
+    countries: jsonb("countries").$type<string[]>().notNull().default([]),
+    languages: jsonb("languages").$type<string[]>().notNull().default([]),
     /** ugc — шукаємо авторів контенту на замовлення; affiliate — авторів із партнерськими вітринами. */
     focus: text("focus").$type<"ugc" | "affiliate">().notNull().default("ugc"),
     /** Скільком найкращим кандидатам робити візуальний аудит (він витрачає ліміти мовної моделі). */
@@ -258,3 +269,44 @@ export const searchCandidates = pgTable(
 export type Creator = typeof creators.$inferSelect;
 export type Search = typeof searches.$inferSelect;
 export type SearchCandidate = typeof searchCandidates.$inferSelect;
+
+export type ScrapeField = { name: string; selector?: string; attr?: string };
+export type ScrapeMode = "auto" | "selectors" | "ai";
+
+/** Пакетний збір сторінок із витягом полів. */
+export const scrapeJobs = pgTable(
+  "scrape_jobs",
+  {
+    id: serial("id").primaryKey(),
+    name: text("name").notNull(),
+    urls: jsonb("urls").$type<string[]>().notNull(),
+    mode: text("mode").$type<ScrapeMode>().notNull().default("auto"),
+    fields: jsonb("fields").$type<ScrapeField[]>().notNull().default([]),
+    /** Дозволити платний Firecrawl, коли сторінка не віддалася безкоштовно. */
+    allowPaid: boolean("allow_paid").notNull().default(false),
+    status: text("status").$type<"queued" | "running" | "done" | "failed" | "cancelled">().notNull().default("queued"),
+    done: integer("done").notNull().default(0),
+    total: integer("total").notNull().default(0),
+    failed: integer("failed").notNull().default(0),
+    error: text("error"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    finishedAt: ts("finished_at"),
+  },
+  (t) => [index("scrape_jobs_status_idx").on(t.status, t.createdAt)],
+).enableRLS();
+
+export const scrapeResults = pgTable(
+  "scrape_results",
+  {
+    id: serial("id").primaryKey(),
+    jobId: integer("job_id").notNull().references(() => scrapeJobs.id, { onDelete: "cascade" }),
+    url: text("url").notNull(),
+    data: jsonb("data").$type<Record<string, string | number | null>>().notNull().default({}),
+    via: text("via"),
+    error: text("error"),
+    fetchedAt: ts("fetched_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("scrape_results_job_url_idx").on(t.jobId, t.url)],
+).enableRLS();
+
+export type ScrapeJob = typeof scrapeJobs.$inferSelect;

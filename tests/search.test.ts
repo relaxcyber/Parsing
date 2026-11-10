@@ -349,6 +349,28 @@ describe("search pipeline", () => {
     await rm(collagePath(by.anna.c.id), { force: true });
   });
 
+  it("filters by country and language when known, lets unknown through, and flags suspicious engagement", async () => {
+    const db = await testDb();
+    await addTestKey(db, "apify", "ap");
+    const local = {
+      ...profiles,
+      anna: { ...profiles.anna, biography: "UGC creator 🇺🇸 anna@gmail.com", followersCount: 80000,
+        latestPosts: latest("anna", [2, 9]).map((p) => ({ ...p, likesCount: 40 })) },
+      ben: { ...profiles.ben, biography: "makeup ugc 🇮🇳", followersCount: 3000 },
+      eve: { ...profiles.eve, private: false, biography: "skincare content creator", latestPosts: latest("eve", [3]) },
+    };
+    const { mock } = await world(posts, local, { pages });
+    vi.stubGlobal("fetch", mock);
+    await newSearch(db, { auditLimit: 0, countries: ["US", "GB"], languages: ["en"] });
+    await runNextSearch(db);
+    const by = await candidates(db);
+    expect([by.anna.c.country, by.anna.cand.stage]).toEqual(["US", "qualified"]);
+    expect(by.anna.cand.reasons.join()).toMatch(/залученість 0\.05% — можлива накрутка/);
+    expect([by.ben.c.country, by.ben.cand.reasons.at(-1)]).toEqual(["IN", "інша країна (IN)"]);
+    expect([by.eve.c.country, by.eve.cand.stage]).toEqual([null, "qualified"]);
+    expect(by.eve.cand.reasons).toContain("країну не визначено");
+  });
+
   it("a suppressed creator is erased and never collected again", async () => {
     const db = await testDb();
     await addTestKey(db, "apify", "ap");

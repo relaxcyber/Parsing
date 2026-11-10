@@ -9,6 +9,7 @@ import {
   type Creator, type CreatorRate, type Search, type SearchProgress, type SearchStats,
 } from "@/db/schema";
 import { activityOf, activityStatus } from "@/enrich/activity";
+import { detectCountry, detectLanguage } from "@/enrich/geo";
 import { checkEmail, usable, type EmailCheck } from "@/enrich/email";
 import { extractLinkPage } from "@/enrich/linkpage";
 import { classifyLinks } from "@/enrich/links";
@@ -27,6 +28,8 @@ const PROFILE_CHUNK = 50;
 /** Пороги якості: нижче MIN — відхиляємо, від LEAD — «готовий лід». */
 export const QUALITY_MIN = 40;
 export const QUALITY_LEAD = 70;
+const SUSPICIOUS_MIN_FOLLOWERS = 5000;
+const SUSPICIOUS_ER = 0.003;
 
 export const estimateCostUsd = (s: Pick<Search, "hashtags" | "postsPerTag" | "maxProfiles">) =>
   Math.round((s.hashtags.length * s.postsPerTag + s.maxProfiles) * PRICE_PER_RESULT_USD * 100) / 100;
@@ -186,6 +189,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
     stats.profilesFetched = 0;
     /** Свіжі обкладинки дописів: посилання Instagram живуть недовго, тому аудит робимо в цьому ж проході. */
     const covers = new Map<string, string[]>();
+    const videos = new Map<string, string[]>();
     for (let i = 0; i < need.length; i += PROFILE_CHUNK) {
       await setProgress(db, searchId, { stage: "Збираю профілі відібраних авторів", done: i, total: need.length }, stats);
       const chunk = need.slice(i, i + PROFILE_CHUNK);
@@ -201,6 +205,11 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
         const own = items.filter((p) => p.kind !== "profile" && p.author?.username?.toLowerCase() === username);
         const act = activityOf(own.map((p) => ({ publishedAt: p.publishedAt ? new Date(p.publishedAt) : undefined, metrics: p.metrics ?? {} })), item.author.followers);
         covers.set(username, own.map((p) => coverOf(p)).filter((u): u is string => !!u));
+        videos.set(username, own.flatMap((p) => (p.media ?? []).filter((m) => m.type === "video").map((m) => m.url)));
+        const likes = own.map((p) => p.metrics?.likes).filter((n): n is number => typeof n === "number").sort((a, b) => a - b);
+        const erLikes = likes.length && item.author.followers ? Math.round((likes[Math.floor(likes.length / 2)] / item.author.followers) * 10000) / 10000 : null;
+        const geo = detectCountry({ bio: item.author.bio, links: item.author.links });
+        const lang = detectLanguage([item.author.bio ?? "", ...own.map((p) => p.text ?? ""), ...(byAuthor.get(username)?.posts.map((p) => p.item.text ?? "") ?? [])].join("\n"));
         await db.update(creators)
           .set({
             displayName: item.author.displayName ?? null, bio: item.author.bio ?? null, externalId: item.author.id ?? null,
@@ -210,6 +219,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
             isPrivate: typeof r.private === "boolean" ? r.private : null,
             isBusiness: typeof r.isBusinessAccount === "boolean" ? r.isBusinessAccount : null,
             lastPostAt: act.lastPostAt, medianViews: act.medianViews, erViews: act.erViews,
+            erLikes, country: geo.country, countryConfidence: geo.country ? geo.confidence : null, language: lang.language,
             profileFetchedAt: now, updatedAt: now,
           })
           .where(and(eq(creators.platform, search.platform), eq(creators.username, username)));
@@ -236,6 +246,9 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
       if (s.blocked) reject.push("відсіяно стоп-словом");
       if (s.negative) reject.push("не окремий автор (магазин, агенція чи платформа)");
       if (activityStatus(c.lastPostAt, now) === "ghost") reject.push("не публікує понад 30 днів");
+      // Країну й мову знаємо не завжди: невизначені проходять, явно інші — відсіюються.
+      if (search.countries.length && c.country && !search.countries.includes(c.country)) reject.push(`інша країна (${c.country})`);
+      if (search.languages.length && c.language && !search.languages.includes(c.language)) reject.push(`інша мова (${c.language})`);
       rows.push({ c, fit: s.fit, reasons: s.reasons, reject });
     }
     const alive = rows.filter((r) => r.reject.length === 0);
@@ -309,7 +322,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
       }
       for (let attempt = 0; ; attempt++) {
         try {
-          const result = await auditCreator(db, row.c.id, urls);
+          const result = await auditCreator(db, row.c.id, { covers: urls, videos: videos.get(row.c.username) });
           if ("skipped" in result) row.reasons.push(`аудит пропущено: ${result.skipped}`);
           else {
             const [updated] = await db.update(creators)
@@ -345,7 +358,11 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
         if (quality != null && quality < QUALITY_MIN) reject.push(`низька якість зйомки (${Math.round(quality)})`);
         const ok = reject.length === 0;
         const active = activityStatus(row.c.lastPostAt, now) === "active";
-        const lead = ok && active && (row.bestEmail === "personal" || row.bestEmail === "business") && quality != null && quality >= QUALITY_LEAD;
+        // Велика аудиторія при майже нульових вподобаннях — типова ознака накрутки.
+        const suspicious = row.c.followers != null && row.c.followers >= SUSPICIOUS_MIN_FOLLOWERS && row.c.erLikes != null && row.c.erLikes < SUSPICIOUS_ER;
+        if (suspicious) row.reasons.push(`мінус: залученість ${(row.c.erLikes! * 100).toFixed(2)}% — можлива накрутка підписників`);
+        if (search.countries.length && !row.c.country) row.reasons.push("країну не визначено");
+        const lead = ok && active && !suspicious && (row.bestEmail === "personal" || row.bestEmail === "business") && quality != null && quality >= QUALITY_LEAD;
         if (ok) qualified++;
         if (lead) leads++;
         return { row, stage: ok ? ("qualified" as const) : ("rejected" as const), quality, readiness: row.readiness as number | null, reasons: [...row.reasons, ...reject], lead };
@@ -390,8 +407,8 @@ export async function requeueInterrupted(db: Db): Promise<void> {
 
 const g = globalThis as unknown as { __searchWorker?: boolean };
 
-/** Фоновий виконавець у процесі сервера: один пошук за раз. */
-export function startSearchWorker(getDb: () => Db): void {
+/** Фоновий виконавець у процесі сервера: по одному завданню за раз; extra — інші черги (пакетний збір). */
+export function startSearchWorker(getDb: () => Db, extra: ((db: Db) => Promise<boolean>)[] = []): void {
   if (g.__searchWorker) return;
   g.__searchWorker = true;
   let busy = false;
@@ -399,7 +416,11 @@ export function startSearchWorker(getDb: () => Db): void {
     if (busy) return;
     busy = true;
     try {
-      while (await runNextSearch(getDb()));
+      const queues = [runNextSearch, ...extra];
+      for (let worked = true; worked; ) {
+        worked = false;
+        for (const next of queues) if (await next(getDb())) worked = true;
+      }
     } catch (e) {
       console.error("Помилка виконавця пошуків:", e);
     } finally {

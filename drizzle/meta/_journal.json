@@ -43,6 +43,13 @@
       "when": 1794318033960,
       "tag": "0005_slim_abomination",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794319436100,
+      "tag": "0006_purple_exiles",
+      "breakpoints": true
     }
   ]
 }
