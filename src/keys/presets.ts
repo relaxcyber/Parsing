@@ -1,3 +1,4 @@
+import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@/db/client";
 import { providers } from "@/db/schema";
 
@@ -27,4 +28,8 @@ export async function seedProviders(db: Db) {
     .insert(providers)
     .values(PRESETS.map((p) => ({ ...p, builtin: true })))
     .onConflictDoNothing({ target: providers.slug });
+  // Стартова модель для вже наявних провайдерів, якщо користувач її ще не задав.
+  for (const p of PRESETS) {
+    if (p.model) await db.update(providers).set({ model: p.model }).where(and(eq(providers.slug, p.slug), isNull(providers.model)));
+  }
 }
