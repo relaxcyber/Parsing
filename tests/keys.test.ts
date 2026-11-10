@@ -192,3 +192,33 @@ describe("key import", () => {
     expect(decryptSecret(rows[1].secretEnc)).toBe("gsk_bbbbbbbbbbbb");
   });
 });
+
+describe("supabase connection helpers", () => {
+  it("re-encodes a pasted password with special characters", async () => {
+    const { normalizeConnectionString } = await import("@/db/supabase");
+    const url = normalizeConnectionString("postgresql://postgres.abc:p@ss#1!:x/y?@aws-0-eu-west-1.pooler.supabase.com:5432/postgres")!;
+    const u = new URL(url);
+    expect(decodeURIComponent(u.password)).toBe("p@ss#1!:x/y?");
+    expect([u.username, u.hostname, u.port, u.pathname]).toEqual(["postgres.abc", "aws-0-eu-west-1.pooler.supabase.com", "5432", "/postgres"]);
+    // уже закодований пароль не кодується вдруге
+    expect(normalizeConnectionString(url)).toBe(url);
+    expect(normalizeConnectionString("https://example.com")).toBeNull();
+  });
+
+  it("extracts the project ref and finds the working pooler region", async () => {
+    const { discoverConnection, parseProjectRef } = await import("@/db/supabase");
+    expect(parseProjectRef("https://abcdefghijklmnopqrst.supabase.co")).toBe("abcdefghijklmnopqrst");
+    expect(parseProjectRef("abcdefghijklmnopqrst")).toBe("abcdefghijklmnopqrst");
+    expect(parseProjectRef("postgresql://x:y@h/db")).toBeNull();
+
+    const probe = async (url: string) => {
+      const u = new URL(url);
+      if (u.hostname !== "aws-1-eu-west-3.pooler.supabase.com") throw new Error("Tenant or user not found");
+      if (decodeURIComponent(u.password) !== "pa!@#") throw new Error("password authentication failed for user");
+    };
+    const found = await discoverConnection("abcdefghijklmnopqrst", "pa!@#", probe);
+    expect(found).toEqual({ url: "postgresql://postgres.abcdefghijklmnopqrst:pa!%40%23@aws-1-eu-west-3.pooler.supabase.com:5432/postgres" });
+    expect(await discoverConnection("abcdefghijklmnopqrst", "wrong", probe)).toMatchObject({ error: "password" });
+    expect(await discoverConnection("abcdefghijklmnopqrst", "x", async () => { throw new Error("Tenant or user not found"); })).toMatchObject({ error: "not-found" });
+  });
+});

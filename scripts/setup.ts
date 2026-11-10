@@ -7,6 +7,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { connect } from "../src/db/connection";
+import { discoverConnection, normalizeConnectionString, parseProjectRef } from "../src/db/supabase";
 
 const FILE = ".env";
 const current: Record<string, string> = {};
@@ -43,31 +44,72 @@ function explain(e: any, url: URL): string {
   return msg;
 }
 
+async function works(url: string, timeoutSec = 30): Promise<void> {
+  const sql = connect(url, 1, timeoutSec);
+  try {
+    await sql`select 1`;
+  } finally {
+    await sql.end({ timeout: 2 }).catch(() => {});
+  }
+}
+
+const argRef = (() => {
+  const i = process.argv.indexOf("--supabase");
+  return i > 0 ? parseProjectRef(process.argv[i + 1] ?? "") : null;
+})();
+
+/** Supabase за ідентифікатором проєкту: питаємо лише пароль бази, адресу знаходимо самі. */
+async function fromProject(ref: string): Promise<string | null> {
+  for (;;) {
+    const password = await ask(`   Пароль бази проєкту ${ref} (Enter — ввести рядок підключення вручну): `);
+    if (!password) return null;
+    process.stdout.write("   Шукаю базу проєкту… ");
+    const found = await discoverConnection(ref, password, (url) => works(url, 10));
+    if ("url" in found) {
+      console.log(`знайдено (${new URL(found.url).hostname}).`);
+      return found.url;
+    }
+    console.log("не вдалося.");
+    if (found.error === "password") console.log("   Пароль не підійшов. Його можна скинути в Supabase: Project Settings → Database → Reset database password.\n");
+    else if (found.error === "not-found") console.log("   Проєкт із таким ідентифікатором не знайдено або його призупинено — відкрийте панель Supabase і за потреби натисніть Restore.\n");
+    else console.log(`   Немає зв’язку із Supabase. Перевірте інтернет. (${found.detail.slice(0, 120)})\n`);
+  }
+}
+
 async function askDatabase(): Promise<string> {
   console.log("\n1) База даних");
-  console.log("   Supabase: відкрийте проєкт → кнопка Connect → вкладка «Session pooler» → скопіюйте рядок");
-  console.log("   і замініть [YOUR-PASSWORD] на пароль бази.");
+  if (argRef) {
+    const url = await fromProject(argRef);
+    if (url) return url;
+  }
+  console.log("   Supabase: введіть адресу проєкту (https://….supabase.co) — далі знадобиться лише пароль бази.");
+  console.log("   Або вставте повний рядок підключення (postgresql://…).");
   for (;;) {
     const hint = current.DATABASE_URL ? " (Enter — залишити поточний)" : "";
-    const value = (await ask(`   Рядок підключення${hint}: `)) || current.DATABASE_URL || "";
-    if (!URL.canParse(value) || !/^postgres(ql)?:$/.test(new URL(value).protocol)) {
-      console.log("   Це не схоже на рядок підключення: він починається з postgresql://\n");
+    const input = (await ask(`   Адреса проєкту або рядок підключення${hint}: `)) || current.DATABASE_URL || "";
+    const ref = parseProjectRef(input);
+    if (ref) {
+      const url = await fromProject(ref);
+      if (url) return url;
       continue;
     }
-    if (/\[YOUR-PASSWORD\]|%5BYOUR-PASSWORD%5D/i.test(value)) {
+    if (/\[YOUR-PASSWORD\]|%5BYOUR-PASSWORD%5D/i.test(input)) {
       console.log("   У рядку лишився шаблон [YOUR-PASSWORD] — замініть його на справжній пароль бази.\n");
       continue;
     }
+    // Пароль зі спецсимволами (@ # : /) кодуємо самі — вручну це роблять з помилками.
+    const value = normalizeConnectionString(input);
+    if (!value) {
+      console.log("   Не розпізнано. Потрібна адреса проєкту Supabase або рядок, що починається з postgresql://\n");
+      continue;
+    }
     process.stdout.write("   Перевіряю з’єднання… ");
-    const sql = connect(value, 1);
     try {
-      await sql`select 1`;
+      await works(value);
       console.log("працює.");
       return value;
     } catch (e) {
       console.log(`не вдалося.\n   ${explain(e, new URL(value)).replace(/\n/g, "\n   ")}\n`);
-    } finally {
-      await sql.end({ timeout: 2 }).catch(() => {});
     }
   }
 }
