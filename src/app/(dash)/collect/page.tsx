@@ -1,12 +1,13 @@
 import { desc } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { contentItems } from "@/db/schema";
+import { scraplingAvailable } from "@/collect/scrapling";
 import { runCollect } from "./actions";
 import { SubmitButton } from "./submit-button";
 
 const SOURCE: Record<string, string> = { web: "Веб", reddit: "Reddit", instagram: "Instagram", tiktok: "TikTok", x: "X" };
 const KIND: Record<string, string> = { post: "допис", comment: "коментар", profile: "профіль", article: "сторінка", video: "відео" };
-const VIA: Record<string, string> = { local: "локально", "reddit-api": "Reddit API", firecrawl: "Firecrawl", apify: "Apify" };
+const VIA: Record<string, string> = { local: "локально", scrapling: "Scrapling", "scrapling-stealth": "Scrapling (браузер)", "reddit-api": "Reddit API", firecrawl: "Firecrawl", apify: "Apify" };
 
 const nf = new Intl.NumberFormat("uk-UA", { notation: "compact", maximumFractionDigits: 1 });
 const df = new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -19,6 +20,7 @@ const cut = (s: string | undefined, max: number) => {
 
 export default async function CollectPage({ searchParams }: { searchParams: Promise<{ msg?: string }> }) {
   const { msg } = await searchParams;
+  const scrapling = await scraplingAvailable();
   const rows = await getDb().select().from(contentItems).orderBy(desc(contentItems.fetchedAt), desc(contentItems.id)).limit(50);
 
   return (
@@ -46,8 +48,9 @@ export default async function CollectPage({ searchParams }: { searchParams: Prom
           <SubmitButton />
         </form>
         <p className="muted" style={{ margin: "12px 0 0" }}>
-          Сторінки спершу завантажуються локально й безкоштовно; Firecrawl витрачає кредит лише коли сайт не віддався.
-          Instagram іде через Apify і може тривати до кількох хвилин.
+          Сторінки спершу завантажуються локально й безкоштовно: прямий запит, потім Scrapling (обхід захисту від ботів).
+          Firecrawl витрачає кредит лише коли жоден локальний спосіб не впорався. Instagram іде через Apify і може тривати до кількох хвилин.
+          {" "}{scrapling ? "Scrapling встановлено." : "Scrapling не встановлено — захищені сайти одразу підуть у Firecrawl (див. README)."}
         </p>
       </section>
 

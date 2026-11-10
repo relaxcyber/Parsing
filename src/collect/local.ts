@@ -46,6 +46,15 @@ export function extractHtml(html: string, url: string, now = new Date()): Conten
   };
 }
 
+/** Спільна для всіх локальних способів перевірка: це справжній вміст, а не заглушка захисту? */
+export function checkedItem(html: string, url: string, via: ContentItemInput["via"]): ContentItemInput {
+  if (CHALLENGE.test(html.slice(0, 20_000))) throw new LocalMiss("сторінка захисту від ботів");
+  const item = extractHtml(html, url);
+  // Майже порожній текст при великому HTML — сторінка малюється скриптами.
+  if ((item.text?.length ?? 0) < 200 && html.length > 5_000) throw new LocalMiss("вміст рендериться скриптами");
+  return { ...item, via };
+}
+
 export async function fetchLocal(url: string): Promise<ContentItemInput> {
   let res: Response;
   try {
@@ -61,9 +70,5 @@ export async function fetchLocal(url: string): Promise<ContentItemInput> {
   const type = res.headers.get("content-type") ?? "";
   if (!/html|xml/.test(type)) throw new LocalMiss(`не HTML (${type || "невідомий тип"})`);
   const html = await res.text();
-  if (CHALLENGE.test(html.slice(0, 20_000))) throw new LocalMiss("сторінка захисту від ботів");
-  const item = extractHtml(html, res.url || url);
-  // Майже порожній текст при великому HTML — сторінка малюється скриптами.
-  if ((item.text?.length ?? 0) < 200 && html.length > 5_000) throw new LocalMiss("вміст рендериться скриптами");
-  return { ...item, id: url, url };
+  return checkedItem(html, url, "local");
 }

@@ -6,6 +6,7 @@ import { NoKeyAvailableError } from "@/keys/router";
 import { fetchFirecrawl } from "./firecrawl";
 import { fetchInstagramHashtag, fetchInstagramProfiles } from "./instagram";
 import { fetchLocal, LocalMiss } from "./local";
+import { fetchScrapling, ScraplingMissing } from "./scrapling";
 
 export type Target =
   | { type: "url"; url: string }
@@ -37,17 +38,31 @@ export async function saveItems(db: Db, inputs: ContentItemInput[]): Promise<Con
   return items;
 }
 
+/** Безкоштовні локальні способи — від найшвидшого до найпотужнішого. */
+const LOCAL_TIERS: { name: string; run: (url: string) => Promise<ContentItemInput> }[] = [
+  { name: "Прямий запит", run: fetchLocal },
+  { name: "Scrapling", run: (url) => fetchScrapling(url, "http") },
+  { name: "Scrapling (браузер)", run: (url) => fetchScrapling(url, "stealth") },
+];
+
 async function collectUrl(db: Db, url: string, notes: string[]): Promise<ContentItemInput[]> {
-  try {
-    return [await fetchLocal(url)];
-  } catch (e) {
-    if (!(e instanceof LocalMiss)) throw e;
-    notes.push(`Локально не вдалося (${e.message}) — використано Firecrawl`);
+  const misses: string[] = [];
+  for (const tier of LOCAL_TIERS) {
+    try {
+      const item = await tier.run(url);
+      if (misses.length) notes.push(`${misses.join("; ")} — спрацював ${tier.name}`);
+      return [item];
+    } catch (e) {
+      if (!(e instanceof LocalMiss)) throw e;
+      if (!(e instanceof ScraplingMissing)) misses.push(`${tier.name}: ${e.message}`);
+    }
   }
   try {
-    return [await fetchFirecrawl(db, url)];
+    const item = await fetchFirecrawl(db, url);
+    notes.push(`${misses.join("; ")} — використано Firecrawl`);
+    return [item];
   } catch (e) {
-    if (e instanceof NoKeyAvailableError) throw new Error(`${notes.at(-1)?.replace(" — використано Firecrawl", "")}, а вільного ключа Firecrawl немає`);
+    if (e instanceof NoKeyAvailableError) throw new Error(`Локально не вдалося (${misses.join("; ")}), а вільного ключа Firecrawl немає`);
     throw e;
   }
 }

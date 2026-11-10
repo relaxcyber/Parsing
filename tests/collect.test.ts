@@ -1,4 +1,8 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetScraplingCache } from "@/collect/scrapling";
 import { ContentItemSchema } from "@/core/contract";
 import { collect, saveItems } from "@/collect";
 import { mapFirecrawl } from "@/collect/firecrawl";
@@ -7,6 +11,26 @@ import { extractHtml } from "@/collect/local";
 import { contentItems, usageEvents } from "@/db/schema";
 import { addTestKey, testDb } from "./helpers";
 
+// Підроблений scrapling: поведінку задає змінна FAKE_SCRAPLING (http=...;stealth=...).
+const fakeDir = mkdtempSync(path.join(os.tmpdir(), "fake-scrapling-"));
+const fakeBin = path.join(fakeDir, "scrapling");
+writeFileSync(fakeBin, `#!/usr/bin/env node
+const fs = require("fs");
+const [, , a, mode, url, out] = process.argv;
+if (a === "--help") process.exit(0);
+const plan = Object.fromEntries((process.env.FAKE_SCRAPLING || "").split(";").map((p) => p.split("=")));
+const what = plan[mode === "get" ? "http" : "stealth"] || "ok";
+const body = "Справжній вміст статті. ".repeat(30);
+if (what === "ok") { fs.writeFileSync(out, "<html><head><title>Via " + mode + "</title></head><body><main>" + body + "</main></body></html>"); console.log("INFO: Fetched (200) <GET " + url + ">"); }
+else if (what === "challenge") { fs.writeFileSync(out, "<html><body><h1>Just a moment...</h1></body></html>"); console.log("INFO: Fetched (403) <GET " + url + ">"); }
+else process.exit(1);
+`);
+chmodSync(fakeBin, 0o755);
+
+beforeEach(() => {
+  process.env.SCRAPLING_BIN = path.join(fakeDir, "missing"); // за замовчуванням Scrapling «не встановлено»
+  resetScraplingCache();
+});
 afterEach(() => vi.unstubAllGlobals());
 
 const html = (body: string, head = "") => `<html lang="uk"><head><title>Назва</title>${head}</head><body>${body}</body></html>`;
@@ -98,10 +122,53 @@ describe("cascade", () => {
     expect((await db.select().from(usageEvents))[0]).toMatchObject({ ok: true, units: 1, purpose: "scrape" });
   });
 
+  const useFake = (plan: string) => {
+    process.env.SCRAPLING_BIN = fakeBin;
+    process.env.FAKE_SCRAPLING = plan;
+    resetScraplingCache();
+  };
+  const blocked = () => vi.fn(async (url: string) => {
+    if (url.includes("firecrawl.dev")) throw new Error("Firecrawl must not be called");
+    return page("no", { status: 403 });
+  });
+
+  it("uses Scrapling when the direct request is blocked, without touching Firecrawl", async () => {
+    const db = await testDb();
+    await addTestKey(db, "firecrawl", "fc");
+    useFake("http=ok");
+    vi.stubGlobal("fetch", blocked());
+    const r = await collect(db, { type: "url", url: "https://guarded.example/a" });
+    expect(r.items[0]).toMatchObject({ via: "scrapling", title: "Via get" });
+    expect(r.notes[0]).toMatch(/Прямий запит: HTTP 403 — спрацював Scrapling$/);
+    expect(await db.select().from(usageEvents)).toHaveLength(0);
+  });
+
+  it("escalates to the stealth browser when Scrapling's HTTP mode hits a challenge", async () => {
+    const db = await testDb();
+    useFake("http=challenge;stealth=ok");
+    vi.stubGlobal("fetch", blocked());
+    const r = await collect(db, { type: "url", url: "https://guarded.example/b" });
+    expect(r.items[0]).toMatchObject({ via: "scrapling-stealth", title: "Via fetch" });
+    expect(r.notes[0]).toContain("Scrapling: HTTP 403");
+  });
+
+  it("falls through to Firecrawl when both Scrapling modes fail", async () => {
+    const db = await testDb();
+    await addTestKey(db, "firecrawl", "fc");
+    useFake("http=challenge;stealth=crash");
+    vi.stubGlobal("fetch", vi.fn(async (url: string) =>
+      url.includes("firecrawl.dev")
+        ? Response.json({ success: true, data: { markdown: "from firecrawl", metadata: {} } })
+        : page("no", { status: 403 })));
+    const r = await collect(db, { type: "url", url: "https://guarded.example/c" });
+    expect(r.items[0].via).toBe("firecrawl");
+    expect(r.notes[0]).toContain("Scrapling (браузер)");
+  });
+
   it("explains when the page is blocked and no Firecrawl key is available", async () => {
     const db = await testDb();
     vi.stubGlobal("fetch", vi.fn(async () => page("no", { status: 403 })));
-    await expect(collect(db, { type: "url", url: "https://guarded.example/" })).rejects.toThrow(/HTTP 403.*Firecrawl немає/);
+    await expect(collect(db, { type: "url", url: "https://guarded.example/" })).rejects.toThrow(/HTTP 403.*Firecrawl немає/s);
   });
 
   it("routes an Instagram profile URL to Apify and upserts on repeat", async () => {
