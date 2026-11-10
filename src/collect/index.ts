@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, sql } from "drizzle-orm";
 import { ContentItemSchema, type ContentItem, type ContentItemInput } from "@/core/contract";
 import type { Db } from "@/db/client";
@@ -170,6 +171,38 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
       .set({ status: "done", itemIds: saved.ids, skipped: skipped.length, finishedAt: new Date() })
       .where(eq(collectRuns.id, run.id));
     return { items: saved.items, ids: saved.ids, cached: false, notes, skipped };
+  } catch (e) {
+    await db.update(collectRuns)
+      .set({ status: "failed", error: (e instanceof Error ? e.message : String(e)).slice(0, 2000), finishedAt: new Date() })
+      .where(eq(collectRuns.id, run.id));
+    throw e;
+  }
+}
+
+/**
+ * Профілі пачкою — одним запуском актора (дешевше й швидше, ніж по одному).
+ * Повертає сирі записи профілів разом з елементами; цілі з одним і тим самим набором імен кешуються 24 год.
+ */
+export async function collectProfiles(db: Db, usernames: string[], opts: { fresh?: boolean } = {}): Promise<{ batch: Batch; ids: number[] }> {
+  const names = [...new Set(usernames.map((u) => cleanHandle(u).toLowerCase()))].sort();
+  if (names.length === 0) return { batch: { collected: [], skipped: [] }, ids: [] };
+  const key = `ig-profiles:${createHash("sha1").update(names.join(",")).digest("hex").slice(0, 16)}:${names.length}`;
+
+  await db.update(collectRuns).set({ status: "failed", error: "перервано", finishedAt: new Date() })
+    .where(and(eq(collectRuns.targetKey, key), eq(collectRuns.status, "running"), lt(collectRuns.startedAt, new Date(Date.now() - STALE_RUN_MS))));
+  const [run] = await db.insert(collectRuns).values({ targetKey: key }).onConflictDoNothing().returning({ id: collectRuns.id });
+  if (!run) throw new AlreadyRunningError("Ці профілі вже збираються");
+  try {
+    const batch = await fetchInstagramProfiles(db, names, {
+      onStart: async (externalRunId) => {
+        await db.update(collectRuns).set({ externalRunId }).where(eq(collectRuns.id, run.id));
+      },
+    });
+    const saved = await saveItems(db, batch.collected);
+    await db.update(collectRuns)
+      .set({ status: "done", itemIds: saved.ids, skipped: batch.skipped.length + saved.skipped.length, finishedAt: new Date() })
+      .where(eq(collectRuns.id, run.id));
+    return { batch, ids: saved.ids };
   } catch (e) {
     await db.update(collectRuns)
       .set({ status: "failed", error: (e instanceof Error ? e.message : String(e)).slice(0, 2000), finishedAt: new Date() })

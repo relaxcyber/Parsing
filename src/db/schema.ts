@@ -121,3 +121,86 @@ export const sessions = pgTable("sessions", {
 
 export type Provider = typeof providers.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;
+
+/** Креатор — окрема сутність: один рядок на автора, скільки б дописів і пошуків його не згадували. */
+export const creators = pgTable(
+  "creators",
+  {
+    id: serial("id").primaryKey(),
+    platform: text("platform").notNull(),
+    /** Ім’я в нижньому регістрі — ключ дедуплікації в межах платформи. */
+    username: text("username").notNull(),
+    externalId: text("external_id"),
+    displayName: text("display_name"),
+    bio: text("bio"),
+    followers: integer("followers"),
+    postsCount: integer("posts_count"),
+    links: jsonb("links").$type<string[]>().notNull().default([]),
+    emails: jsonb("emails").$type<string[]>().notNull().default([]),
+    avatarUrl: text("avatar_url"),
+    isPrivate: boolean("is_private"),
+    isBusiness: boolean("is_business"),
+    verified: boolean("verified"),
+    profileFetchedAt: ts("profile_fetched_at"),
+    firstSeenAt: ts("first_seen_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("creators_platform_username_idx").on(t.platform, t.username)],
+).enableRLS();
+
+export type SearchProgress = { stage: string; done: number; total: number };
+export type SearchStats = {
+  posts?: number; authors?: number; shortlisted?: number; profilesFetched?: number; profilesReused?: number; qualified?: number;
+};
+
+export const searches = pgTable(
+  "searches",
+  {
+    id: serial("id").primaryKey(),
+    name: text("name").notNull(),
+    platform: text("platform").notNull().default("instagram"),
+    hashtags: jsonb("hashtags").$type<string[]>().notNull(),
+    /** Слова ніші: що більше збігів у дописах і біо, то вищий Fit. */
+    keywords: jsonb("keywords").$type<string[]>().notNull().default([]),
+    stopWords: jsonb("stop_words").$type<string[]>().notNull().default([]),
+    postsPerTag: integer("posts_per_tag").notNull().default(50),
+    maxProfiles: integer("max_profiles").notNull().default(150),
+    minFollowers: integer("min_followers"),
+    maxFollowers: integer("max_followers"),
+    outreachLanguage: text("outreach_language").notNull().default("en"),
+    status: text("status").$type<"queued" | "running" | "done" | "failed" | "cancelled">().notNull().default("queued"),
+    progress: jsonb("progress").$type<SearchProgress>(),
+    stats: jsonb("stats").$type<SearchStats>().notNull().default({}),
+    error: text("error"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    startedAt: ts("started_at"),
+    finishedAt: ts("finished_at"),
+  },
+  (t) => [index("searches_status_idx").on(t.status, t.createdAt)],
+).enableRLS();
+
+export const searchCandidates = pgTable(
+  "search_candidates",
+  {
+    id: serial("id").primaryKey(),
+    searchId: integer("search_id").notNull().references(() => searches.id, { onDelete: "cascade" }),
+    creatorId: integer("creator_id").notNull().references(() => creators.id, { onDelete: "cascade" }),
+    stage: text("stage").$type<"found" | "filtered_out" | "shortlisted" | "rejected" | "qualified">().notNull().default("found"),
+    /** Три вектори оцінки, 0–10. Quality заповнить візуальний аудит. */
+    fit: doublePrecision("fit"),
+    readiness: doublePrecision("readiness"),
+    quality: doublePrecision("quality"),
+    score: doublePrecision("score").notNull().default(0),
+    reasons: jsonb("reasons").$type<string[]>().notNull().default([]),
+    postIds: jsonb("post_ids").$type<number[]>().notNull().default([]),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("search_candidates_unique_idx").on(t.searchId, t.creatorId),
+    index("search_candidates_rank_idx").on(t.searchId, t.stage, t.score),
+  ],
+).enableRLS();
+
+export type Creator = typeof creators.$inferSelect;
+export type Search = typeof searches.$inferSelect;
+export type SearchCandidate = typeof searchCandidates.$inferSelect;

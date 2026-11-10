@@ -17,7 +17,6 @@ export default async function DashLayout({ children }: { children: React.ReactNo
       <nav className="side">
         <div className="brand">Parsing</div>
         <Nav />
-        <span className="soon">Пошук креаторів · скоро</span>
         <span className="soon">Вітрина · скоро</span>
         <form action={signOut}>
           <button className="link">Вийти</button>
