@@ -150,7 +150,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
     // 3. Безкоштовний відбір за підписами (і біо, якщо профіль уже є).
     const scored = names.map((username) => {
       const c = creatorBy.get(username)!;
-      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(username), bio: c.bio, affiliate: c.affiliate });
+      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(username), bio: c.bio, affiliate: c.affiliate, names: [c.username, c.displayName] });
       return { username, creator: c, postIds: byAuthor.get(username)!.posts.map((p) => p.id), ...s };
     });
     scored.sort((a, b) => b.fit - a.fit || b.postIds.length - a.postIds.length || a.username.localeCompare(b.username));
@@ -227,7 +227,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
     type Row = { c: Creator; fit: number; reasons: string[]; reject: string[] };
     const rows: Row[] = [];
     for (const c of await loadCreators(shortlist.map((s) => s.username))) {
-      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(c.username), bio: c.bio, affiliate: c.affiliate });
+      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(c.username), bio: c.bio, affiliate: c.affiliate, names: [c.username, c.displayName] });
       const reject: string[] = [];
       if (c.followers == null && c.bio == null) reject.push("профіль не знайдено");
       if (c.isPrivate) reject.push("закритий профіль");
@@ -278,7 +278,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
       : [];
     type Ranked = Row & { readiness: number; bestEmail: string | null };
     const ranked: Ranked[] = alive.map((row) => {
-      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(row.c.username), bio: row.c.bio, affiliate: row.c.affiliate });
+      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(row.c.username), bio: row.c.bio, affiliate: row.c.affiliate, names: [row.c.username, row.c.displayName] });
       const best = contactRows.filter((k) => k.creatorId === row.c.id && row.c.emails.includes(k.email))
         .sort((a, b) => (EMAIL_RANK[b.status] ?? 0) - (EMAIL_RANK[a.status] ?? 0))[0];
       const days = row.c.lastPostAt ? Math.floor((now.getTime() - row.c.lastPostAt.getTime()) / DAY) : null;

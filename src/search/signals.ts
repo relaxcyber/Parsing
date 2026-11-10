@@ -30,7 +30,8 @@ const AFFILIATE_ROLE: Signal[] = [
 const NEGATIVE: Signal[] = [
   { pattern: /\b(giveaway|sweepstake)\b|розіграш|розыгрыш/i, weight: 10, reason: "розіграш" },
   { pattern: /\b(shop now|order now|free shipping|wholesale|we ship|in stock|dm to order)\b|доставка по/i, weight: 15, reason: "схоже на магазин" },
-  { pattern: /\b(agency|we (are|help|create)|our (team|clients|services))\b|агенці|агентств/i, weight: 15, reason: "схоже на агенцію" },
+  { pattern: /\b(agency|agencia|talent management|management company|we (are|help|create)|our (team|clients|services)|join us)\b|агенці|агентств/i, weight: 15, reason: "схоже на агенцію" },
+  { pattern: /\b(community of creators|comunidad de creadores|creator (community|network|collective)|creadores de contenido\/)/i, weight: 15, reason: "спільнота, а не окремий автор" },
   { pattern: /\b(marketplace|platform for|hire (ugc )?creators|verified (ugc )?creators|brands?\s*[×x&]\s*creators|for brands and creators|start free)\b/i, weight: 20, reason: "схоже на платформу-посередника" },
 ];
 
@@ -59,6 +60,8 @@ export type ScoreInput = {
   focus?: Focus;
   /** Партнерські платформи, знайдені в посиланнях автора. */
   affiliate?: string[];
+  /** Ім’я акаунта й показуване ім’я: за ними видно агенції та магазини. */
+  names?: (string | null | undefined)[];
 };
 
 export type Score = {
@@ -95,9 +98,13 @@ export function scoreCandidate(input: ScoreInput): Score {
     reasons.push(`партнерки: ${input.affiliate.join(", ")}`);
   }
 
-  let penalty = 0;
+  // Назву акаунта перевіряємо лише на «мінуси»: «…agency», «…shop» у імені — це не автор.
+  const names = (input.names ?? []).filter(Boolean).join(" ");
+  const businessName = /(agency|agencia|talent|management|publicidad|marketing|boutique|\bshop\b|\bstore\b|official(shop|store)|_shop|shop_|store_|_store)/i.test(names);
+  let penalty = businessName ? 15 : 0;
+  if (businessName) reasons.push("мінус: назва акаунта схожа на бізнес");
   for (const s of NEGATIVE) {
-    if (s.pattern.test(corpus)) {
+    if (s.pattern.test(`${corpus}\n${names}`)) {
       penalty += s.weight;
       reasons.push(`мінус: ${s.reason}`);
     }

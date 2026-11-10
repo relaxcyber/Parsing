@@ -191,7 +191,7 @@ export default async function SearchDetail({ params, searchParams }: {
                         {Object.entries(c.socials).filter(([k]) => k !== "instagram").map(([k, v]) => <div key={k} className="muted">{k}: {v}</div>)}
                         {mine.length === 0 && c.links.length === 0 && "—"}
                       </td>
-                      <td className="muted" style={{ maxWidth: 240 }}>{cand.reasons.join(" · ")}</td>
+                      <td className="muted" style={{ minWidth: 200, maxWidth: 280 }}>{cand.reasons.join(" · ")}</td>
                       <td>
                         <form action={suppress}>
                           <input type="hidden" name="id" value={c.id} /><input type="hidden" name="searchId" value={s.id} /><input type="hidden" name="view" value={view} />

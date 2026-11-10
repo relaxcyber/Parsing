@@ -91,7 +91,7 @@ export async function auditCreator(db: Db, creatorId: number, imageUrls: string[
       images.push(buf);
     } catch {}
   }
-  if (images.length < 2) return { skipped: images.length ? "замало зображень для оцінки" : "зображення недоступні (посилання застаріли)" };
+  if (images.length < 2) return { skipped: images.length ? "замало зображень для оцінки" : "не вдалося завантажити зображення дописів" };
 
   const collage = await buildCollage(images);
   await mkdir(path.dirname(collagePath(creatorId)), { recursive: true });

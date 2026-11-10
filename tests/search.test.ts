@@ -37,6 +37,12 @@ describe("fit index", () => {
     const s = scoreCandidate({ keywords: [], stopWords: [], texts: [], bio: "Real influencers. Brands × verified UGC creators. Start free" });
     expect(s.negative).toBe(true);
   });
+  it("treats agency-like account names and communities as not an individual", () => {
+    const agency = scoreCandidate({ keywords: [], stopWords: [], texts: ["ugc creator"], bio: "Full-Service Talent Management. Join Us", names: ["celestetalentagency", "Celeste Talent Agency"] });
+    expect(agency.negative).toBe(true);
+    expect(scoreCandidate({ keywords: [], stopWords: [], texts: [], bio: "Comunidad de Creadores", names: ["influ"] }).negative).toBe(true);
+    expect(scoreCandidate({ keywords: [], stopWords: [], texts: ["ugc creator"], names: ["anna.creates", "Anna"] }).negative).toBe(false);
+  });
   it("matches Cyrillic niche words and whole words only", () => {
     expect(scoreCandidate({ keywords: ["догляд"], stopWords: [], texts: ["Мій догляд за шкірою"] }).fit).toBe(60);
     expect(scoreCandidate({ keywords: ["art"], stopWords: [], texts: ["a smart start"] }).fit).toBe(0);
