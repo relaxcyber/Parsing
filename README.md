@@ -21,14 +21,38 @@
 ## Запуск
 
 ```bash
-cp .env.example .env        # заполнить MASTER_KEY и DASHBOARD_PASSWORD
-docker compose up -d db     # Postgres на 127.0.0.1:5433
+cp .env.example .env   # заполнить DATABASE_URL, MASTER_KEY и DASHBOARD_PASSWORD
 npm install
-npm run db:migrate
-npm run build && npm start  # http://localhost:3000
+npm run shortcut       # ярлык «Parsing» на рабочем столе
 ```
 
+Дальше — двойной щелчок по ярлыку (или `npm run launch`): применяются миграции, при первом
+запуске собирается приложение, поднимается сервер и открывается http://localhost:3000.
+Журнал сервера — `data/server.log`. После `git pull` выполните `npm install && npm run build`
+и перезапустите сервер.
+
 `MASTER_KEY` менять нельзя: им зашифрованы сохранённые ключи.
+
+### База данных
+
+**Supabase.** В проекте Supabase: Connect → Session pooler → скопировать строку вида
+`postgresql://postgres.<ref>:<пароль>@aws-0-<регион>.pooler.supabase.com:5432/postgres`
+в `DATABASE_URL`. Таблицы создаст первый запуск. На всех таблицах включён RLS без политик,
+поэтому через публичный API Supabase (anon-ключ) данные недоступны.
+
+**Локально.** `docker compose up -d db` и `DATABASE_URL` из `.env.example`.
+
+### Ключи
+
+По одному — формой на странице `/keys`. Пачкой — из файла, который не попадает в git:
+
+```bash
+cp keys.example.txt keys.txt   # вписать ключи
+npm run keys:import -- keys.txt
+```
+
+Все ключи одного провайдера образуют общий пул: запросы (и аудит, и письма) берут тот,
+у которого больше свободной квоты.
 
 ## Разработка
 

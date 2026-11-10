@@ -124,3 +124,20 @@ describe("contract", () => {
     expect(() => ContentItemSchema.parse({ ...base, source: "web", url: "not a url" })).toThrow();
   });
 });
+
+describe("key import", () => {
+  it("adds keys, skips duplicates and reports bad lines", async () => {
+    const { importKeys } = await import("@/keys/import");
+    const db = await testDb();
+    const text = ["# comment", "", "groq | аудит | gsk_aaaaaaaaaaaa", "Groq | листи | gsk_bbbbbbbbbbbb | 1000 | requests | day",
+      "groq | повтор | gsk_aaaaaaaaaaaa", "nope | x | y", "mistral | без ключа"].join("\n");
+    const report = await importKeys(db, text);
+    expect(report).toHaveLength(5);
+    expect(report[2]).toContain("уже додано");
+    expect(report[3]).toContain("невідомий провайдер");
+    expect(report[4]).toContain("потрібні назва і ключ");
+    const rows = await db.select().from(apiKeys);
+    expect(rows.map((r) => [r.label, r.quotaLimit, r.quotaPeriod])).toEqual([["аудит", null, "day"], ["листи", 1000, "day"]]);
+    expect(decryptSecret(rows[1].secretEnc)).toBe("gsk_bbbbbbbbbbbb");
+  });
+});

@@ -9,6 +9,10 @@ export const quotaPeriod = pgEnum("quota_period", ["minute", "day", "month", "no
 
 const ts = (name: string) => timestamp(name, { withTimezone: true });
 
+/**
+ * RLS увімкнено на всіх таблицях без політик: це закриває публічний REST API Supabase.
+ * Застосунок підключається як власник таблиць, тому його це не обмежує.
+ */
 export const providers = pgTable("providers", {
   id: serial("id").primaryKey(),
   slug: text("slug").notNull().unique(),
@@ -18,7 +22,7 @@ export const providers = pgTable("providers", {
   baseUrl: text("base_url"),
   model: text("model"),
   builtin: boolean("builtin").notNull().default(false),
-});
+}).enableRLS();
 
 export const apiKeys = pgTable(
   "api_keys",
@@ -42,7 +46,7 @@ export const apiKeys = pgTable(
     createdAt: ts("created_at").notNull().defaultNow(),
   },
   (t) => [index("api_keys_provider_idx").on(t.providerId)],
-);
+).enableRLS();
 
 export const usageEvents = pgTable(
   "usage_events",
@@ -56,7 +60,7 @@ export const usageEvents = pgTable(
     purpose: text("purpose"),
   },
   (t) => [index("usage_events_key_at_idx").on(t.keyId, t.at)],
-);
+).enableRLS();
 
 export const contentItems = pgTable(
   "content_items",
@@ -74,7 +78,7 @@ export const contentItems = pgTable(
     uniqueIndex("content_items_source_ext_idx").on(t.source, t.externalId),
     index("content_items_author_idx").on(t.source, t.authorUsername),
   ],
-);
+).enableRLS();
 
 export type Provider = typeof providers.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;

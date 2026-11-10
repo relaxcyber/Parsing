@@ -12,7 +12,8 @@ export function getDb(): Db {
   if (!g.__db) {
     const url = process.env.DATABASE_URL;
     if (!url) throw new Error("DATABASE_URL не задано (див. .env.example)");
-    g.__db = drizzle(postgres(url, { max: 5 }), { schema });
+    // Транзакційний пулер Supabase (порт 6543) не підтримує підготовлені запити.
+    g.__db = drizzle(postgres(url, { max: 5, prepare: !url.includes(":6543") }), { schema });
   }
   return g.__db;
 }

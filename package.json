@@ -10,7 +10,10 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx --env-file-if-exists=.env src/db/migrate.ts"
+    "db:migrate": "tsx --env-file-if-exists=.env src/db/migrate.ts",
+    "keys:import": "tsx --env-file-if-exists=.env src/keys/import.ts",
+    "launch": "node scripts/launch.mjs",
+    "shortcut": "node scripts/shortcut.mjs"
   },
   "dependencies": {
     "cheerio": "^1.2.0",

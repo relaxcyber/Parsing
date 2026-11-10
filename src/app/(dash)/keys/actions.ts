@@ -5,8 +5,8 @@ import { redirect } from "next/navigation";
 import { z } from "zod";
 import { getDb } from "@/db/client";
 import { apiKeys, providers } from "@/db/schema";
-import { encryptSecret, secretTail } from "@/keys/crypto";
-import { canSync, syncKeyQuota } from "@/keys/quota-sync";
+import { syncKeyQuota } from "@/keys/quota-sync";
+import { addKey as storeKey } from "@/keys/store";
 import { requireAuth } from "@/lib/auth";
 
 const back = (msg: string): never => redirect(`/keys?msg=${encodeURIComponent(msg)}`);
@@ -25,19 +25,7 @@ export async function addKey(form: FormData) {
   await requireAuth();
   const parsed = KeyForm.safeParse(Object.fromEntries(form));
   if (!parsed.success) return back("Перевірте поля форми: назва, ключ і ліміт (число більше нуля або порожньо)");
-  const { secret, ...rest } = parsed.data;
-  const db = getDb();
-  const [provider] = await db.select().from(providers).where(eq(providers.id, rest.providerId));
-  if (!provider) return back("Провайдера не знайдено");
-  const [row] = await db
-    .insert(apiKeys)
-    .values({ ...rest, secretEnc: encryptSecret(secret), secretTail: secretTail(secret) })
-    .returning({ id: apiKeys.id });
-  if (canSync(provider.slug)) {
-    const r = await syncKeyQuota(db, row.id);
-    return back(r.ok ? "Ключ додано, залишок отримано від провайдера" : `Ключ додано, але перевірка не вдалася. ${r.message}`);
-  }
-  back("Ключ додано");
+  back((await storeKey(getDb(), parsed.data)).message);
 }
 
 export async function toggleKey(form: FormData) {
