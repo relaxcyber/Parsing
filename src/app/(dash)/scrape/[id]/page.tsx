@@ -64,7 +64,7 @@ export default async function ScrapeDetail({ params }: { params: Promise<{ id: s
         ) : (
           <div className="scroll">
             <table>
-              <thead><tr><th>Сторінка</th>{columns.map((c) => <th key={c}>{c}</th>)}<th>Спосіб</th></tr></thead>
+              <thead><tr><th>Сторінка</th>{columns.map((c) => <th key={c} style={{ minWidth: 90 }}>{c}</th>)}<th>Спосіб</th></tr></thead>
               <tbody>
                 {rows.map((r) => (
                   <tr key={r.id}>
