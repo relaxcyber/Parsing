@@ -36,6 +36,13 @@
       "when": 1794314644068,
       "tag": "0004_glamorous_tempest",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794318033960,
+      "tag": "0005_slim_abomination",
+      "breakpoints": true
     }
   ]
 }

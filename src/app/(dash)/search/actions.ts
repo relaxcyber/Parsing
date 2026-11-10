@@ -6,6 +6,7 @@ import { z } from "zod";
 import { getDb } from "@/db/client";
 import { searches } from "@/db/schema";
 import { requireAuth } from "@/lib/auth";
+import { suppressCreator } from "@/search/suppress";
 
 const list = (max: number) =>
   z.string().transform((v) => [...new Set(v.split(/[,\n]/).map((s) => s.trim().replace(/^#/, "").toLowerCase()).filter(Boolean))].slice(0, max));
@@ -21,6 +22,8 @@ const SearchForm = z.object({
   minFollowers: optionalInt,
   maxFollowers: optionalInt,
   outreachLanguage: z.enum(["en", "uk", "ru", "pl", "de", "es"]),
+  focus: z.enum(["ugc", "affiliate"]),
+  auditLimit: z.coerce.number().int().min(0).max(150),
 });
 
 export async function createSearch(form: FormData) {
@@ -58,4 +61,12 @@ export async function deleteSearch(form: FormData) {
   await requireAuth();
   await getDb().delete(searches).where(eq(searches.id, id(form)));
   redirect(`/search?msg=${encodeURIComponent("Пошук видалено")}`);
+}
+
+/** Видалити автора й більше ніколи його не збирати (запит на видалення даних). */
+export async function suppress(form: FormData) {
+  await requireAuth();
+  const searchId = z.coerce.number().int().positive().parse(form.get("searchId"));
+  await suppressCreator(getDb(), id(form), "видалено вручну з дашборда");
+  redirect(`/search/${searchId}?view=${encodeURIComponent(String(form.get("view") ?? "qualified"))}`);
 }

@@ -74,3 +74,5 @@ button:disabled { opacity: 0.6; cursor: progress; }
 .tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
 .tabs a { padding: 8px 12px; text-decoration: none; color: var(--ink-2); border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .tabs a.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--ink); }
+.badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--good); color: var(--ink); margin: 2px 0; }
+.collage { border-radius: 6px; display: block; object-fit: cover; background: var(--line); margin-bottom: 4px; }

@@ -142,15 +142,63 @@ export const creators = pgTable(
     isBusiness: boolean("is_business"),
     verified: boolean("verified"),
     profileFetchedAt: ts("profile_fetched_at"),
+    /** Активність: дата останнього допису та перегляди відносно аудиторії. */
+    lastPostAt: ts("last_post_at"),
+    medianViews: integer("median_views"),
+    erViews: doublePrecision("er_views"),
+    /** Знайдене на сторінках-візитках і в посиланнях профілю. */
+    affiliate: jsonb("affiliate").$type<string[]>().notNull().default([]),
+    portfolio: jsonb("portfolio").$type<string[]>().notNull().default([]),
+    socials: jsonb("socials").$type<Record<string, string>>().notNull().default({}),
+    rates: jsonb("rates").$type<CreatorRate[]>().notNull().default([]),
+    linksCheckedAt: ts("links_checked_at"),
+    /** Візуальний аудит: Quality Index 0–100 і сира відповідь моделі. */
+    quality: doublePrecision("quality"),
+    audit: jsonb("audit").$type<Record<string, unknown>>(),
+    auditedAt: ts("audited_at"),
     firstSeenAt: ts("first_seen_at").notNull().defaultNow(),
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
   (t) => [uniqueIndex("creators_platform_username_idx").on(t.platform, t.username)],
 ).enableRLS();
 
+export type CreatorRate = { title: string; amount: number; currency: string; sourceUrl: string };
+
+/** Контакти з походженням: звідки взято адресу й коли — потрібно для GDPR (ст. 14) і для довіри до бази. */
+export const creatorContacts = pgTable(
+  "creator_contacts",
+  {
+    id: serial("id").primaryKey(),
+    creatorId: integer("creator_id").notNull().references(() => creators.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+    status: text("status").notNull(),
+    confidence: doublePrecision("confidence").notNull(),
+    mx: text("mx"),
+    /** bio — з профілю; link_page — зі сторінки-візитки. */
+    source: text("source").notNull(),
+    sourceUrl: text("source_url").notNull(),
+    foundAt: ts("found_at").notNull().defaultNow(),
+    checkedAt: ts("checked_at").notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("creator_contacts_unique_idx").on(t.creatorId, t.email)],
+).enableRLS();
+
+/** Список виключень (GDPR ст. 21): цих авторів і адреси більше не збираємо й не показуємо. */
+export const suppressions = pgTable(
+  "suppressions",
+  {
+    id: serial("id").primaryKey(),
+    /** "instagram:name" або "email:<sha256>". */
+    key: text("key").notNull().unique(),
+    reason: text("reason"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+).enableRLS();
+
 export type SearchProgress = { stage: string; done: number; total: number };
 export type SearchStats = {
   posts?: number; authors?: number; shortlisted?: number; profilesFetched?: number; profilesReused?: number; qualified?: number;
+  linkPages?: number; withEmail?: number; audited?: number; leads?: number; note?: string;
 };
 
 export const searches = pgTable(
@@ -168,6 +216,10 @@ export const searches = pgTable(
     minFollowers: integer("min_followers"),
     maxFollowers: integer("max_followers"),
     outreachLanguage: text("outreach_language").notNull().default("en"),
+    /** ugc — шукаємо авторів контенту на замовлення; affiliate — авторів із партнерськими вітринами. */
+    focus: text("focus").$type<"ugc" | "affiliate">().notNull().default("ugc"),
+    /** Скільком найкращим кандидатам робити візуальний аудит (він витрачає ліміти мовної моделі). */
+    auditLimit: integer("audit_limit").notNull().default(30),
     status: text("status").$type<"queued" | "running" | "done" | "failed" | "cancelled">().notNull().default("queued"),
     progress: jsonb("progress").$type<SearchProgress>(),
     stats: jsonb("stats").$type<SearchStats>().notNull().default({}),
@@ -186,12 +238,14 @@ export const searchCandidates = pgTable(
     searchId: integer("search_id").notNull().references(() => searches.id, { onDelete: "cascade" }),
     creatorId: integer("creator_id").notNull().references(() => creators.id, { onDelete: "cascade" }),
     stage: text("stage").$type<"found" | "filtered_out" | "shortlisted" | "rejected" | "qualified">().notNull().default("found"),
-    /** Три вектори оцінки, 0–10. Quality заповнить візуальний аудит. */
+    /** Три незалежні індекси, 0–100. Quality дає візуальний аудит (порожньо, якщо його не було). */
     fit: doublePrecision("fit"),
     readiness: doublePrecision("readiness"),
     quality: doublePrecision("quality"),
     score: doublePrecision("score").notNull().default(0),
     reasons: jsonb("reasons").$type<string[]>().notNull().default([]),
+    /** «Готовий лід»: активний, є придатний email і якість візуалу не нижче порога. */
+    lead: boolean("lead").notNull().default(false),
     postIds: jsonb("post_ids").$type<number[]>().notNull().default([]),
     createdAt: ts("created_at").notNull().defaultNow(),
   },

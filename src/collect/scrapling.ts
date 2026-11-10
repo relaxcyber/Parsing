@@ -43,6 +43,10 @@ export async function scraplingAvailable(): Promise<boolean> {
 export const resetScraplingCache = () => (available = undefined);
 
 export async function fetchScrapling(url: string, mode: "http" | "stealth"): Promise<ContentItemInput> {
+  return checkedItem(await fetchScraplingHtml(url, mode), url, mode === "http" ? "scrapling" : "scrapling-stealth");
+}
+
+export async function fetchScraplingHtml(url: string, mode: "http" | "stealth"): Promise<string> {
   if (!(await scraplingAvailable())) throw new ScraplingMissing("Scrapling не встановлено");
   const dir = await mkdtemp(path.join(os.tmpdir(), "scrapling-"));
   const out = path.join(dir, "page.html");
@@ -63,7 +67,7 @@ export async function fetchScrapling(url: string, mode: "http" | "stealth"): Pro
     if (status >= 400) throw new LocalMiss(`HTTP ${status}`);
     const html = await readFile(out, "utf8").catch(() => "");
     if (!html.trim()) throw new LocalMiss(r.code === 0 ? "порожня відповідь" : `помилка (${r.output.trim().split("\n").at(-1)?.slice(0, 160)})`);
-    return checkedItem(html, url, mode === "http" ? "scrapling" : "scrapling-stealth");
+    return html;
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

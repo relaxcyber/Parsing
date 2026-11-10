@@ -122,7 +122,8 @@ async function readBody(res: Response): Promise<string> {
   }
 }
 
-export async function fetchLocal(url: string): Promise<ContentItemInput> {
+/** Завантажує сторінку з перевіркою кожної переадресації; повертає HTML і кінцеву адресу. */
+export async function fetchLocalHtml(url: string): Promise<{ html: string; url: string }> {
   let current = url;
   let res: Response | undefined;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
@@ -155,5 +156,16 @@ export async function fetchLocal(url: string): Promise<ContentItemInput> {
     // Обрив посеред тіла або повільна віддача — не привід зупиняти каскад.
     throw new LocalMiss(`мережа: ${e instanceof Error ? e.message : e}`);
   }
-  return checkedItem(html, current, "local");
+  return { html, url: current };
+}
+
+export async function fetchLocal(url: string): Promise<ContentItemInput> {
+  const page = await fetchLocalHtml(url);
+  return checkedItem(page.html, page.url, "local");
+}
+
+/** Чи це заглушка захисту від ботів, а не сама сторінка. */
+export function isChallenge(html: string): boolean {
+  const title = html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1] ?? "";
+  return CHALLENGE.test(title) || (html.length < 30_000 && CHALLENGE.test(html));
 }

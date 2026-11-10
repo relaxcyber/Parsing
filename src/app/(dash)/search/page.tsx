@@ -33,6 +33,14 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
           <label>Підписників від<input name="minFollowers" type="number" min="0" placeholder="1000" /></label>
           <label>Підписників до<input name="maxFollowers" type="number" min="0" placeholder="100000" /></label>
           <label>
+            Кого шукаємо
+            <select name="focus" defaultValue="ugc">
+              <option value="ugc">UGC-креаторів (знімають на замовлення)</option>
+              <option value="affiliate">Афіліатів (вітрини, промокоди)</option>
+            </select>
+          </label>
+          <label>Аудит візуалу для найкращих<input name="auditLimit" type="number" min="0" max="150" defaultValue={30} required /></label>
+          <label>
             Мова листів
             <select name="outreachLanguage" defaultValue="en">
               {Object.entries(LANGS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
@@ -42,7 +50,8 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
         </form>
         <p className="muted" style={{ margin: "12px 0 0" }}>
           Вартість в Apify — приблизно ${PRICE_PER_RESULT_USD} за кожен допис і кожен профіль. Наприклад, 2 хештеги по 50 дописів і 150
-          профілів — близько $0,65. Профілі, зібрані за останні 7 днів, повторно не оплачуються. Пошук іде у фоні — сторінку можна закрити.
+          профілів — близько $0,65. Профілі, зібрані за останні 7 днів, повторно не оплачуються. Контакти зі сторінок-візиток
+          і перевірка email безкоштовні; аудит візуалу витрачає ліміт мовної моделі (0 — не робити). Пошук іде у фоні — сторінку можна закрити.
         </p>
       </section>
 
@@ -54,7 +63,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
           <div className="scroll">
             <table>
               <thead>
-                <tr><th>Назва</th><th>Стан</th><th>Хештеги</th><th className="num">Авторів</th><th className="num">Підходять</th><th>Створено</th></tr>
+                <tr><th>Назва</th><th>Стан</th><th>Хештеги</th><th className="num">Авторів</th><th className="num">Підходять</th><th className="num">Готових лідів</th><th>Створено</th></tr>
               </thead>
               <tbody>
                 {rows.map((r) => (
@@ -67,6 +76,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
                     <td className="muted">{r.hashtags.map((h) => `#${h}`).join(" ")}</td>
                     <td className="num">{r.stats.authors ?? "—"}</td>
                     <td className="num">{r.stats.qualified ?? "—"}</td>
+                    <td className="num">{r.stats.leads ?? "—"}</td>
                     <td style={{ whiteSpace: "nowrap" }}>{df.format(r.createdAt)}</td>
                   </tr>
                 ))}
