@@ -5,12 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetScraplingCache } from "@/collect/scrapling";
 import { ContentItemSchema } from "@/core/contract";
 import { eq } from "drizzle-orm";
-import { AlreadyRunningError, collect, saveItems } from "@/collect";
+import { AlreadyRunningError, collect, failInterruptedRuns, saveItems } from "@/collect";
 import { assertPublicUrl, isPrivateAddress, UnsafeUrlError } from "@/collect/net";
 import { mapFirecrawl } from "@/collect/firecrawl";
 import { mapPost, mapProfile, runCostUsd } from "@/collect/instagram";
 import { checkedItem, extractHtml, LocalMiss } from "@/collect/local";
-import { collectRuns, contentItems, usageEvents } from "@/db/schema";
+import { apiKeys, collectRuns, contentItems, usageEvents } from "@/db/schema";
 import { addTestKey, testDb } from "./helpers";
 
 // Підроблений scrapling: поведінку задає змінна FAKE_SCRAPLING (http=...;stealth=...).
@@ -44,7 +44,7 @@ const page = (text: string, init: ResponseInit = {}) =>
 const apifyMock = (items: unknown[]) =>
   vi.fn(async (url: string, _init?: any) => {
     if (url.includes("/users/me/limits")) return Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0.02 } } });
-    if (url.endsWith("/runs")) return Response.json({ data: { id: "run1", status: "RUNNING", defaultDatasetId: "ds1" } }, { status: 201 });
+    if (url.includes("/runs?")) return Response.json({ data: { id: "run1", status: "RUNNING", defaultDatasetId: "ds1" } }, { status: 201 });
     if (url.includes("/actor-runs/run1")) return Response.json({ data: { id: "run1", status: "SUCCEEDED", defaultDatasetId: "ds1", usageTotalUsd: 0.0123 } });
     if (url.includes("/datasets/ds1/items")) return Response.json(items);
     throw new Error(`unexpected ${url}`);
@@ -154,7 +154,7 @@ describe("cascade", () => {
     return page("no", { status: 403 });
   });
 
-  it("uses Scrapling when the direct request is blocked, without touching Firecrawl", async () => {
+  it.skipIf(process.platform === "win32")("uses Scrapling when the direct request is blocked, without touching Firecrawl", async () => {
     const db = await testDb();
     await addTestKey(db, "firecrawl", "fc");
     useFake("http=ok");
@@ -165,7 +165,7 @@ describe("cascade", () => {
     expect(await db.select().from(usageEvents)).toHaveLength(0);
   });
 
-  it("escalates to the stealth browser when Scrapling's HTTP mode hits a challenge", async () => {
+  it.skipIf(process.platform === "win32")("escalates to the stealth browser when Scrapling's HTTP mode hits a challenge", async () => {
     const db = await testDb();
     useFake("http=challenge;stealth=ok");
     vi.stubGlobal("fetch", blocked());
@@ -174,7 +174,7 @@ describe("cascade", () => {
     expect(r.notes[0]).toContain("Scrapling: HTTP 403");
   });
 
-  it("falls through to Firecrawl when both Scrapling modes fail", async () => {
+  it.skipIf(process.platform === "win32")("falls through to Firecrawl when both Scrapling modes fail", async () => {
     const db = await testDb();
     await addTestKey(db, "firecrawl", "fc");
     useFake("http=challenge;stealth=crash");
@@ -203,7 +203,11 @@ describe("cascade", () => {
     expect(r.ids).toHaveLength(2);
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ usernames: ["maker"] });
     expect(fetchMock.mock.calls[0][0]).toContain("instagram-profile-scraper/runs");
-    expect((await db.select().from(usageEvents))[0]).toMatchObject({ ok: true, units: 0.0123, purpose: "instagram-profile" });
+    expect(fetchMock.mock.calls[0][0]).toMatch(/maxItems=1&maxTotalChargeUsd=0\.05&timeout=840/);
+    expect((await db.select().from(usageEvents).orderBy(usageEvents.id)).map((e) => [e.ok, e.units, e.purpose])).toEqual([
+      [true, 0, "instagram-profile:start"], [true, 0.0123, "instagram-profile"],
+    ]);
+    expect((await db.select().from(collectRuns))[0].externalRunId).toBe("run1");
     const [profileRow] = await db.select().from(contentItems).where(eq(contentItems.externalId, "profile:maker"));
     expect((profileRow.raw as any).followersCount).toBe(10);
 
@@ -213,6 +217,63 @@ describe("cascade", () => {
     expect(fetchMock.mock.calls.length).toBe(runs);
     await collect(db, { type: "instagram-profile", username: "maker" }, { fresh: true });
     expect(await db.select().from(contentItems)).toHaveLength(2);
+  });
+
+  it("never starts a second paid run when reading the result fails, and still records the cost", async () => {
+    const db = await testDb();
+    const a = await addTestKey(db, "apify", "A");
+    await addTestKey(db, "apify", "B");
+    let starts = 0;
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("/users/me/limits")) return Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0 } } });
+      if (url.includes("/runs?")) { starts++; return Response.json({ data: { id: "run9", status: "RUNNING", defaultDatasetId: "ds9" } }); }
+      if (url.includes("/actor-runs/run9")) {
+        return Response.json({ data: { id: "run9", status: "SUCCEEDED", defaultDatasetId: "ds9", pricingInfo: { pricingPerEvent: { actorChargeEvents: { result: { isPrimaryEvent: true, eventPriceUsd: 0.0026 } } } }, chargedEventCounts: { result: 4 } } });
+      }
+      return new Response("forbidden", { status: 403 }); // читання набору даних відхилено
+    }));
+    await expect(collect(db, { type: "instagram-hashtag", tag: "ugc", limit: 4 })).rejects.toThrow(/run9.*7 днів/s);
+    expect(starts).toBe(1);
+    const events = (await db.select().from(usageEvents).orderBy(usageEvents.id)).map((e) => [e.ok, e.units, e.purpose]);
+    expect(events).toEqual([[true, 0, "instagram-hashtag:start"], [false, 0.0104, "instagram-hashtag"]]);
+    const [key] = await db.select().from(apiKeys).where(eq(apiKeys.id, a.id));
+    expect(key.status).toBe("active"); // 403 на читанні — не привід вважати ключ поганим
+    expect((await db.select().from(collectRuns))[0]).toMatchObject({ status: "failed", externalRunId: "run9" });
+  });
+
+  it("remembers an empty result so a repeat does not pay again, and accepts a profile link in profile mode", async () => {
+    const db = await testDb();
+    await addTestKey(db, "apify", "ap");
+    const fetchMock = apifyMock([]);
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await collect(db, { type: "instagram-hashtag", tag: "nothinghere", limit: 5 })).items).toEqual([]);
+    const calls = fetchMock.mock.calls.length;
+    const again = await collect(db, { type: "instagram-hashtag", tag: "nothinghere", limit: 5 });
+    expect(again.cached).toBe(true);
+    expect(fetchMock.mock.calls.length).toBe(calls);
+
+    vi.stubGlobal("fetch", apifyMock([{ username: "maker" }]));
+    await collect(db, { type: "instagram-profile", username: "https://www.instagram.com/Maker/" });
+    expect((await db.select().from(collectRuns)).map((r) => r.targetKey)).toContain("ig-profile:maker");
+  });
+
+  it("clears interrupted runs on server start", async () => {
+    const db = await testDb();
+    await db.insert(collectRuns).values({ targetKey: "ig-profile:maker" });
+    await failInterruptedRuns(db);
+    expect((await db.select().from(collectRuns))[0].status).toBe("failed");
+  });
+
+  it("keeps the cascade going when the page body breaks mid-download", async () => {
+    const db = await testDb();
+    await addTestKey(db, "firecrawl", "fc");
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      if (url.includes("firecrawl.dev")) return Response.json({ success: true, data: { markdown: "rescued", metadata: {} } });
+      const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("<html>")); c.error(new TypeError("terminated")); } });
+      return new Response(body, { headers: { "content-type": "text/html" } });
+    }));
+    const r = await collect(db, { type: "url", url: "https://flaky.example/" });
+    expect(r.items[0]).toMatchObject({ via: "firecrawl", text: "rescued" });
   });
 
   it("fails loudly when the actor's format changes instead of reporting an empty result", async () => {

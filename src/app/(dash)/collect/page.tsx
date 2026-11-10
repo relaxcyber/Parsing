@@ -1,6 +1,6 @@
 import { desc } from "drizzle-orm";
 import { getDb } from "@/db/client";
-import { contentItems } from "@/db/schema";
+import { collectRuns, contentItems } from "@/db/schema";
 import { scraplingAvailable } from "@/collect/scrapling";
 import { runCollect } from "./actions";
 import { SubmitButton } from "./submit-button";
@@ -8,6 +8,17 @@ import { SubmitButton } from "./submit-button";
 const SOURCE: Record<string, string> = { web: "Веб", reddit: "Reddit", instagram: "Instagram", tiktok: "TikTok", x: "X" };
 const KIND: Record<string, string> = { post: "допис", comment: "коментар", profile: "профіль", article: "сторінка", video: "відео" };
 const VIA: Record<string, string> = { local: "локально", scrapling: "Scrapling", "scrapling-stealth": "Scrapling (браузер)", "reddit-api": "Reddit API", firecrawl: "Firecrawl", apify: "Apify" };
+
+const RUN = {
+  running: { label: "Виконується", color: "var(--warning)" },
+  done: { label: "Готово", color: "var(--good)" },
+  failed: { label: "Помилка", color: "var(--critical)" },
+} as const;
+const runTarget = (key: string) =>
+  key.startsWith("url:") ? key.slice(4)
+    : key.startsWith("ig-profile:") ? `Instagram @${key.slice(11)}`
+    : key.startsWith("ig-hashtag:") ? `Instagram #${key.split(":")[1]} (${key.split(":")[2]})`
+    : key;
 
 const nf = new Intl.NumberFormat("uk-UA", { notation: "compact", maximumFractionDigits: 1 });
 const df = new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -21,6 +32,7 @@ const cut = (s: string | undefined, max: number) => {
 export default async function CollectPage({ searchParams }: { searchParams: Promise<{ msg?: string }> }) {
   const { msg } = await searchParams;
   const scrapling = await scraplingAvailable();
+  const runs = await getDb().select().from(collectRuns).orderBy(desc(collectRuns.startedAt)).limit(8);
   const rows = await getDb().select().from(contentItems).orderBy(desc(contentItems.fetchedAt), desc(contentItems.id)).limit(50);
 
   return (
@@ -53,6 +65,35 @@ export default async function CollectPage({ searchParams }: { searchParams: Prom
           {" "}{scrapling ? "Scrapling встановлено." : "Scrapling не встановлено — захищені сайти одразу підуть у Firecrawl (див. README)."}
         </p>
       </section>
+
+      {runs.length > 0 && (
+        <section className="card">
+          <h2>Останні запуски</h2>
+          <div className="scroll">
+            <table>
+              <thead><tr><th>Ціль</th><th>Стан</th><th className="num">Елементів</th><th>Початок</th><th>Примітка</th></tr></thead>
+              <tbody>
+                {runs.map((r) => (
+                  <tr key={r.id}>
+                    <td style={{ maxWidth: 380, overflowWrap: "anywhere" }}>{runTarget(r.targetKey)}</td>
+                    <td>
+                      <span className="status">
+                        <i style={{ background: RUN[r.status].color }} />{RUN[r.status].label}
+                      </span>
+                    </td>
+                    <td className="num">{r.status === "done" ? r.itemIds.length : "—"}</td>
+                    <td style={{ whiteSpace: "nowrap" }}>{df.format(r.startedAt)}</td>
+                    <td className="err">
+                      {r.error ?? (r.skipped ? `пропущено: ${r.skipped}` : "")}
+                      {r.status === "running" && "Оновіть сторінку, щоб побачити результат"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       <section className="card">
         <h2>Останні зібрані елементи</h2>

@@ -1,7 +1,7 @@
 import type { ContentItemInput } from "@/core/contract";
 import type { Db } from "@/db/client";
 import { syncKeyQuota } from "@/keys/quota-sync";
-import { ProviderHttpError, withKey } from "@/keys/router";
+import { ProviderHttpError, reportResult, withKey } from "@/keys/router";
 import { getJson, postJson } from "./http";
 
 const PROFILE_ACTOR = "apify~instagram-profile-scraper";
@@ -80,48 +80,87 @@ export function runCostUsd(run: any, itemCount: number): number {
 const TERMINAL = new Set(["SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"]);
 const API = "https://api.apify.com/v2";
 
+const PRICE_GUESS_USD = 0.003; // трохи вище за поточні $0.0026 за результат
+const POLL_DEADLINE_MS = 15 * 60_000;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export type RunOptions = {
+  /** Скільки результатів очікуємо — обмежує і набір даних, і списання. */
+  maxItems: number;
+  /** Викликається одразу після старту: id запуску треба зберегти, щоб не втратити оплачене. */
+  onStart?: (runId: string) => Promise<void> | void;
+};
+
+/** Після старту запуск уже оплачується: повторюємо лише читання, ніколи не сам запуск. */
+async function retryRead<T>(read: () => Promise<T>, attempts: number): Promise<T> {
+  for (let i = 1; ; i++) {
+    try {
+      return await read();
+    } catch (e) {
+      const fatal = e instanceof ProviderHttpError && [401, 403, 404].includes(e.status);
+      if (fatal || i >= attempts) throw e;
+      await sleep(e instanceof ProviderHttpError && e.retryAfterSec ? Math.min(e.retryAfterSec, 30) * 1000 : 2000 * i);
+    }
+  }
+}
+
 /**
- * Запускає актор асинхронно й чекає завершення опитуванням: обрив з’єднання не губить запуск,
- * а фактична вартість ($) береться із самого запуску й одразу потрапляє в облік квоти.
+ * Запускає актор і забирає результат.
+ * Під withKey — лише сам старт: зміна ключа після старту означала б другий платний запуск.
+ * Опитування та читання набору даних ідуть тим самим ключем із власними повторами, а вартість
+ * записується в облік за будь-якого завершення — успіх, помилка чи вичерпаний час.
  */
-async function runActor(db: Db, actor: string, input: unknown, purpose: string): Promise<any[]> {
-  let keyId = 0;
-  const items = await withKey(
+async function runActor(db: Db, actor: string, input: unknown, purpose: string, opts: RunOptions): Promise<any[]> {
+  // Стеля списання на рівні Apify: зайвого не зніме, навіть якщо актор поверне більше.
+  const cap = Math.max(0.05, opts.maxItems * PRICE_GUESS_USD * 1.5).toFixed(2);
+  const query = `maxItems=${opts.maxItems}&maxTotalChargeUsd=${cap}&timeout=${POLL_DEADLINE_MS / 1000 - 60}`;
+  const { key, started } = await withKey(
     db,
     "apify",
     async (key, usage) => {
-      keyId = key.id;
-      usage.units = 0;
-      const started = (await postJson(`${API}/acts/${actor}/runs`, key.secret, input, 60_000))?.data;
+      usage.units = 0; // вартість запишемо після завершення
+      const started = (await postJson(`${API}/acts/${actor}/runs?${query}`, key.secret, input, 60_000))?.data;
       if (!started?.id) throw new Error("Apify: запуск не створено");
-      let run = started;
-      const deadline = Date.now() + 15 * 60_000;
-      while (!TERMINAL.has(run.status)) {
-        if (Date.now() > deadline) throw new Error(`Apify: запуск ${run.id} триває понад 15 хв — перевірте його в консолі Apify`);
-        try {
-          run = (await getJson(`${API}/actor-runs/${started.id}?waitForFinish=30`, key.secret, 60_000))?.data ?? run;
-        } catch (e) {
-          // Збій опитування не скасовує сам запуск — пробуємо ще, поки не вийде час.
-          if (e instanceof ProviderHttpError && [401, 403, 404].includes(e.status)) throw e;
-          await new Promise((r) => setTimeout(r, 3000));
-        }
-      }
-      usage.units = runCostUsd(run, 0);
-      if (run.status !== "SUCCEEDED") throw new Error(`Apify: запуск завершився зі станом ${run.status}`);
-      const res = await getJson(`${API}/datasets/${run.defaultDatasetId}/items?clean=true&format=json`, key.secret, 120_000);
-      if (!Array.isArray(res)) throw new Error("Apify: неочікувана відповідь");
-      usage.units = runCostUsd(run, res.length);
-      return res;
+      return { key, started };
     },
-    { purpose },
+    { purpose: `${purpose}:start` },
   );
-  // Звірка — уточнення; основний облік уже зроблено вартістю запуску. Помилку звірки
-  // syncKeyQuota сам записує в lastError ключа.
-  await syncKeyQuota(db, keyId).catch(() => {});
-  return items;
+  await opts.onStart?.(started.id);
+
+  let run = started;
+  let items: any[] | undefined;
+  let failure: Error | undefined;
+  try {
+    const deadline = Date.now() + POLL_DEADLINE_MS;
+    while (!TERMINAL.has(run.status)) {
+      if (Date.now() > deadline) throw new Error(`Apify: запуск ${run.id} триває понад 15 хв`);
+      run = (await retryRead(() => getJson(`${API}/actor-runs/${started.id}?waitForFinish=30`, key.secret, 60_000), 5))?.data ?? run;
+    }
+    // Частковий результат (вичерпано час або стелю списання) теж оплачений — забираємо його.
+    if (run.status === "FAILED" || run.status === "ABORTED") throw new Error(`Apify: запуск завершився зі станом ${run.status}`);
+    const res = await retryRead(() => getJson(`${API}/datasets/${run.defaultDatasetId}/items?clean=true&format=json`, key.secret, 120_000), 4);
+    if (!Array.isArray(res)) throw new Error("Apify: неочікувана відповідь");
+    items = res;
+  } catch (e) {
+    failure = new Error(
+      `${e instanceof Error ? e.message : e}. Запуск Apify ${started.id} міг бути оплачений — його результат зберігається в Apify 7 днів.`,
+    );
+  }
+  await reportResult(db, key.id, {
+    ok: !failure, units: runCostUsd(run, items?.length ?? 0), httpStatus: failure ? undefined : 200, error: failure?.message, purpose,
+  }).catch((e) => console.error("Не вдалося записати вартість запуску Apify:", e));
+  // Звірка — уточнення фактичного залишку; свою помилку вона сама пише в lastError ключа.
+  await syncKeyQuota(db, key.id).catch(() => {});
+  if (failure) throw failure;
+  return items!;
 }
 
-export const cleanHandle = (v: string) => v.trim().replace(/^[@#]/, "").replace(/\/+$/, "");
+/** «@name», «#tag» або посилання на профіль → чисте ім’я. */
+export const cleanHandle = (v: string) => {
+  const t = v.trim();
+  const fromUrl = t.match(/^https?:\/\/(?:www\.)?instagram\.com\/([A-Za-z0-9._]+)\/?(?:\?.*)?$/)?.[1];
+  return (fromUrl ?? t).replace(/^[@#]/, "").replace(/\/+$/, "");
+};
 
 export type Collected = { item: ContentItemInput; raw?: unknown };
 export type Batch = { collected: Collected[]; skipped: string[] };
@@ -152,12 +191,15 @@ function mapBatch(raw: any[], map: (r: any) => ContentItemInput[], what: string)
   return { collected, skipped };
 }
 
-export async function fetchInstagramProfiles(db: Db, usernames: string[]): Promise<Batch> {
-  const raw = await runActor(db, PROFILE_ACTOR, { usernames: usernames.map(cleanHandle) }, "instagram-profile");
+type OnStart = Pick<RunOptions, "onStart">;
+
+export async function fetchInstagramProfiles(db: Db, usernames: string[], opts: OnStart = {}): Promise<Batch> {
+  const names = usernames.map(cleanHandle);
+  const raw = await runActor(db, PROFILE_ACTOR, { usernames: names }, "instagram-profile", { maxItems: names.length, ...opts });
   return mapBatch(raw, (r) => mapProfile(r), "профілі");
 }
 
-export async function fetchInstagramHashtag(db: Db, tag: string, limit: number): Promise<Batch> {
-  const raw = await runActor(db, HASHTAG_ACTOR, { hashtags: [cleanHandle(tag)], resultsLimit: limit }, "instagram-hashtag");
+export async function fetchInstagramHashtag(db: Db, tag: string, limit: number, opts: OnStart = {}): Promise<Batch> {
+  const raw = await runActor(db, HASHTAG_ACTOR, { hashtags: [cleanHandle(tag)], resultsLimit: limit }, "instagram-hashtag", { maxItems: limit, ...opts });
   return mapBatch(raw, (r) => [mapPost(r)].filter((p): p is ContentItemInput => p != null), "дописи");
 }

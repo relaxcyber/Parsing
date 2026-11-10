@@ -147,5 +147,13 @@ export async function fetchLocal(url: string): Promise<ContentItemInput> {
   if (!res.ok) throw new LocalMiss(`HTTP ${res.status}`);
   const type = res.headers.get("content-type") ?? "";
   if (type && !/html|xml/.test(type)) throw new LocalMiss(`не HTML (${type})`, true);
-  return checkedItem(await readBody(res), current, "local");
+  let html: string;
+  try {
+    html = await readBody(res);
+  } catch (e) {
+    if (e instanceof LocalMiss) throw e;
+    // Обрив посеред тіла або повільна віддача — не привід зупиняти каскад.
+    throw new LocalMiss(`мережа: ${e instanceof Error ? e.message : e}`);
+  }
+  return checkedItem(html, current, "local");
 }

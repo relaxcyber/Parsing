@@ -114,6 +114,13 @@ async function collectUrl(db: Db, url: string, notes: string[]): Promise<Batch> 
 
 export class AlreadyRunningError extends Error {}
 
+/** Після перезапуску сервера незавершених зборів бути не може (процес один) — знімаємо блокування. */
+export async function failInterruptedRuns(db: Db): Promise<void> {
+  await db.update(collectRuns)
+    .set({ status: "failed", error: "перервано перезапуском сервера", finishedAt: new Date() })
+    .where(eq(collectRuns.status, "running"));
+}
+
 /**
  * Єдина точка входу збирача: кеш за ціллю, захист від подвійного запуску,
  * вибір адаптера, збереження. Повертає елементи разом з їхніми id у базі.
@@ -127,6 +134,10 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
     const [last] = await db.select().from(collectRuns)
       .where(and(eq(collectRuns.targetKey, key), eq(collectRuns.status, "done"), gte(collectRuns.startedAt, new Date(Date.now() - ttlMs))))
       .orderBy(desc(collectRuns.startedAt)).limit(1);
+    // Порожній результат теж пам’ятаємо (годину), щоб повторний запит не запускав платний актор знову.
+    if (last && last.itemIds.length === 0 && last.startedAt > new Date(Date.now() - Math.min(ttlMs, HOUR))) {
+      return { items: [], ids: [], cached: true, cachedAt: last.startedAt, notes: ["Минулого разу нічого не знайдено"], skipped: [] };
+    }
     if (last?.itemIds.length) {
       const rows = await db.select().from(contentItems).where(inArray(contentItems.id, last.itemIds));
       const byId = new Map(rows.map((r) => [r.id, r]));
@@ -142,13 +153,16 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
   const [run] = await db.insert(collectRuns).values({ targetKey: key }).onConflictDoNothing().returning({ id: collectRuns.id });
   if (!run) throw new AlreadyRunningError("Цей збір уже виконується — дочекайтеся результату й оновіть сторінку");
 
+  const onStart = async (externalRunId: string) => {
+    await db.update(collectRuns).set({ externalRunId }).where(eq(collectRuns.id, run.id));
+  };
   try {
     const batch =
       target.type === "url"
         ? await collectUrl(db, target.url, notes)
         : target.type === "instagram-profile"
-          ? await fetchInstagramProfiles(db, [target.username])
-          : await fetchInstagramHashtag(db, target.tag, target.limit!);
+          ? await fetchInstagramProfiles(db, [target.username], { onStart })
+          : await fetchInstagramHashtag(db, target.tag, target.limit!, { onStart });
     const saved = await saveItems(db, batch.collected);
     const skipped = [...batch.skipped, ...saved.skipped];
     if (saved.items.length === 0 && target.type !== "url") notes.push("Instagram нічого не повернув — перевірте назву");

@@ -106,6 +106,14 @@ export async function acquireKey(db: Db, slug: string, opts: { exclude?: number[
   });
 }
 
+/** Драйвер загортає помилку бази, тому код шукаємо по всьому ланцюжку cause. */
+function isForeignKeyViolation(e: unknown): boolean {
+  for (let cur: any = e, i = 0; cur && i < 5; cur = cur.cause, i++) {
+    if (cur.code === "23503" || /foreign key constraint/i.test(String(cur.message))) return true;
+  }
+  return false;
+}
+
 export type CallReport = {
   ok: boolean;
   /** Скільки одиниць квоти списати (запити, кредити, токени...). */
@@ -124,7 +132,9 @@ export async function reportResult(db: Db, keyId: number, r: CallReport): Promis
   // Усе рахує сама база одним UPDATE: паралельні звіти не затирають один одного.
   const start = sql`case when ${apiKeys.quotaPeriod} = 'none' then null else date_trunc(${apiKeys.quotaPeriod}::text, ${nowSql}, 'UTC') end`;
   const rolled = sql`coalesce(${apiKeys.periodStartedAt} < (${start}), false)`;
-  const nextPeriod = sql`coalesce((${start}) + ('1 ' || ${apiKeys.quotaPeriod}::text)::interval, ${nowSql} + interval '1 hour')`;
+  // Для періоду «none» наступного періоду немає — пауза на годину (далі ключ перевірить звірка).
+  const step = sql`case ${apiKeys.quotaPeriod} when 'minute' then interval '1 minute' when 'day' then interval '1 day' when 'month' then interval '1 month' end`;
+  const nextPeriod = sql`coalesce((${start}) + (${step}), ${nowSql} + interval '1 hour')`;
 
   const cooldown =
     r.httpStatus === 429
@@ -150,8 +160,26 @@ export async function reportResult(db: Db, keyId: number, r: CallReport): Promis
     await tx.insert(usageEvents).values({ keyId, at: now, units, ok: r.ok, httpStatus: r.httpStatus, purpose: r.purpose });
   }).catch((e) => {
     // Ключ могли видалити під час виклику — це не привід валити збір.
-    if (!/foreign key|violates/i.test(String(e?.message))) throw e;
+    if (!isForeignKeyViolation(e)) throw e;
   });
+}
+
+/**
+ * Звіряє з провайдером ключі, які локально вважаються вичерпаними або на паузі.
+ * Повертає true, якщо хоч один ключ звірено (тобто є сенс спробувати ще раз).
+ */
+async function resyncUnavailable(db: Db, slug: string): Promise<boolean> {
+  const { canSync, syncKeyQuota } = await import("./quota-sync");
+  if (!canSync(slug)) return false;
+  const now = new Date();
+  const rows = await db
+    .select({ key: apiKeys })
+    .from(apiKeys)
+    .innerJoin(providers, eq(apiKeys.providerId, providers.id))
+    .where(and(eq(providers.slug, slug), eq(apiKeys.status, "active")));
+  const stale = rows.filter(({ key }) => keyState(key, now) !== "active" && (!key.lastSyncedAt || now.getTime() - key.lastSyncedAt.getTime() > 5 * 60_000));
+  const results = await Promise.all(stale.map(({ key }) => syncKeyQuota(db, key.id).catch(() => ({ ok: false }))));
+  return results.some((r) => r.ok);
 }
 
 const ROTATE_ON = new Set([401, 402, 403, 429]);
@@ -171,21 +199,27 @@ export async function withKey<T>(
   const max = opts.maxAttempts ?? 5;
   let transientLeft = opts.retryTransient ? 2 : 0;
   let lastError: unknown;
+  let resynced = false;
   for (;;) {
     let key: AcquiredKey;
     try {
       key = await acquireKey(db, slug, { exclude: tried });
     } catch (e) {
+      if (!(e instanceof NoKeyAvailableError)) throw e;
       // Ключі скінчилися вже після невдалих спроб — показуємо справжню причину.
-      if (e instanceof NoKeyAvailableError && lastError) throw lastError;
-      throw e;
+      if (lastError) throw lastError;
+      // Локальний облік міг відстати від провайдера (новий цикл оплати) — звіряємо й пробуємо ще раз.
+      if (resynced || !(await resyncUnavailable(db, slug))) throw e;
+      resynced = true;
+      continue;
     }
     const usage = { units: 1 };
+    let result: T;
+    let failed = false;
     try {
-      const result = await fn(key, usage);
-      await reportResult(db, key.id, { ok: true, units: usage.units, httpStatus: 200, purpose: opts.purpose });
-      return result;
+      result = await fn(key, usage);
     } catch (e) {
+      failed = true;
       lastError = e;
       const http = e instanceof ProviderHttpError ? e : null;
       const rotate = !!http && ROTATE_ON.has(http.status);
@@ -201,9 +235,13 @@ export async function withKey<T>(
       });
       tried.push(key.id);
       if (tried.length >= max) throw e;
-      if (rotate) continue;
-      if (transient && transientLeft-- > 0) continue;
-      throw e;
+      if (!rotate && !(transient && transientLeft-- > 0)) throw e;
     }
+    if (failed) continue;
+    // Звіт про успіх — поза try: збій запису в базу не має перетворити оплачений результат на помилку.
+    await reportResult(db, key.id, { ok: true, units: usage.units, httpStatus: 200, purpose: opts.purpose }).catch((e) =>
+      console.error("Не вдалося записати використання ключа:", e),
+    );
+    return result!;
   }
 }

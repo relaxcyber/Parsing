@@ -3,7 +3,7 @@ import type { Db } from "@/db/client";
 import { apiKeys, providers, type ApiKey } from "@/db/schema";
 import { decryptSecret } from "./crypto";
 
-type Quota = { limit: number | null; used: number; unit: string; period: ApiKey["quotaPeriod"] };
+type Quota = { limit: number | null; used: number; unit: string; period: ApiKey["quotaPeriod"]; resetsAt?: Date | null };
 type Fetch = typeof fetch;
 type Fetcher = (f: Fetch, secret: string, current: ApiKey) => Promise<Quota>;
 
@@ -19,7 +19,13 @@ const num = (v: unknown): number | null => (typeof v === "number" && Number.isFi
 const FETCHERS: Record<string, Fetcher> = {
   async apify(f, secret) {
     const { data } = await getJson(f, "https://api.apify.com/v2/users/me/limits", secret);
-    return { limit: num(data?.limits?.maxMonthlyUsageUsd), used: num(data?.current?.monthlyUsageUsd) ?? 0, unit: "usd", period: "month" };
+    // Цикл оплати Apify рахується від дати реєстрації, а не з 1-го числа, тому календарне
+    // обнулення вимикаємо («none»): стан ключа визначає сам провайдер під час звірки.
+    const end = Date.parse(data?.monthlyUsageCycle?.endAt ?? "");
+    return {
+      limit: num(data?.limits?.maxMonthlyUsageUsd), used: num(data?.current?.monthlyUsageUsd) ?? 0, unit: "usd", period: "none",
+      resetsAt: Number.isNaN(end) ? null : new Date(end),
+    };
   },
   async firecrawl(f, secret, current) {
     const { data } = await getJson(f, "https://api.firecrawl.dev/v1/team/credit-usage", secret);
@@ -57,6 +63,7 @@ export async function syncKeyQuota(db: Db, keyId: number, f: Fetch = fetch): Pro
       .update(apiKeys)
       .set({
         quotaLimit: q.limit, quotaUsed: q.used, quotaUnit: q.unit, quotaPeriod: q.period,
+        ...(q.resetsAt !== undefined ? { providerResetsAt: q.resetsAt } : {}),
         // Провайдер підтвердив стан ключа — локальна пауза більше не потрібна.
         periodStartedAt: now, lastSyncedAt: now, lastError: null, cooldownUntil: null,
         status: row.key.status === "invalid" ? "active" : row.key.status,

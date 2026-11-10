@@ -56,7 +56,13 @@ function QuotaMeter({ k, now }: { k: ApiKey; now: Date }) {
         </span>
         <span>{Math.round(share * 100)}%</span>
       </div>
-      <div className="muted">{reset ? `${PERIOD[k.quotaPeriod]} · скидання ${when(reset)}` : PERIOD.none}</div>
+      <div className="muted">
+        {reset
+          ? `${PERIOD[k.quotaPeriod]} · скидання ${when(reset)}`
+          : k.providerResetsAt && k.providerResetsAt > now
+            ? `оновиться ${when(k.providerResetsAt)}`
+            : PERIOD.none}
+      </div>
     </div>
   );
 }

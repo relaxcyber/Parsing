@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ContentItemInput } from "@/core/contract";
 import { checkedItem, LocalMiss } from "./local";
+import { assertPublicUrl } from "./net";
 
 /**
  * Scrapling (github.com/relaxcyber/Scrapling) — локальний обхід захисту від ботів.
@@ -53,7 +54,11 @@ export async function fetchScrapling(url: string, mode: "http" | "stealth"): Pro
     const r = await run(args, mode === "http" ? 45_000 : 150_000);
     if (r.code === "ENOENT") throw new ScraplingMissing("Scrapling не встановлено");
     if (r.code === "TIMEOUT") throw new LocalMiss("час очікування вичерпано");
-    const status = Number(r.output.match(/Fetched \((\d{3})\)/)?.[1]);
+    // Scrapling сам ходить за переадресаціями. Якщо кінцева адреса — у внутрішній мережі,
+    // відповідь не зберігаємо й не показуємо.
+    const fetched = [...r.output.matchAll(/Fetched \((\d{3})\) <[A-Z]+ (\S+?)>/g)].at(-1);
+    if (fetched?.[2] && URL.canParse(fetched[2])) await assertPublicUrl(fetched[2]);
+    const status = Number(fetched?.[1]);
     if (status === 404 || status === 410) throw new LocalMiss(`HTTP ${status} — сторінки не існує`, true);
     if (status >= 400) throw new LocalMiss(`HTTP ${status}`);
     const html = await readFile(out, "utf8").catch(() => "");

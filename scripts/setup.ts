@@ -119,6 +119,11 @@ async function askPassword(): Promise<string> {
   for (;;) {
     const hint = current.DASHBOARD_PASSWORD ? " (Enter — залишити поточний)" : "";
     const value = (await ask(`   Пароль, щонайменше 8 символів${hint}: `)) || current.DASHBOARD_PASSWORD || "";
+    // Ці символи файл .env читає по-різному в різних програмах — пароль просто перестав би підходити.
+    if (/[\s$#'"\\`]/.test(value)) {
+      console.log("   Не використовуйте пробіли та символи $ # ' \" \\ ` — оберіть інший пароль.\n");
+      continue;
+    }
     if (value.length >= 8) return value;
     console.log("   Закороткий.\n");
   }

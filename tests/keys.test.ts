@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { apiKeys, providers, usageEvents } from "@/db/schema";
 import { decryptSecret, encryptSecret } from "@/keys/crypto";
@@ -164,6 +164,45 @@ describe("review fixes", () => {
     expect((await syncKeyQuota(db, k.id, fake)).ok).toBe(true);
     const after = await getKey(db, k.id);
     expect([after.quotaLimit, after.quotaUsed, after.quotaPeriod, after.cooldownUntil]).toEqual([1000, 100, "month", null]);
+  });
+
+  it("handles 402 on a key without a reset period and moves on to the next key", async () => {
+    const db = await testDb();
+    const a = await addTestKey(db, "groq", "A", { quotaPeriod: "none" });
+    await addTestKey(db, "groq", "B", { quotaPeriod: "none", lastUsedAt: new Date() });
+    const now = new Date("2026-03-10T12:00:00Z");
+    await reportResult(db, a.id, { ok: false, httpStatus: 402, units: 0, now });
+    expect((await getKey(db, a.id)).cooldownUntil.toISOString()).toBe("2026-03-10T13:00:00.000Z");
+    await db.update(apiKeys).set({ cooldownUntil: null }).where(eq(apiKeys.id, a.id));
+    const out = await withKey(db, "groq", async (key) => {
+      if (key.secret === "A") throw new ProviderHttpError(402, "out of credits");
+      return key.secret;
+    });
+    expect(out).toBe("B");
+  });
+
+  it("returns the paid result even if the key was deleted mid-call", async () => {
+    const db = await testDb();
+    const k = await addTestKey(db, "groq", "K");
+    const out = await withKey(db, "groq", async () => {
+      await db.delete(apiKeys).where(eq(apiKeys.id, k.id));
+      return "paid result";
+    });
+    expect(out).toBe("paid result");
+  });
+
+  it("re-syncs a locally exhausted key with the provider before giving up", async () => {
+    const db = await testDb();
+    await addTestKey(db, "apify", "ap", { quotaLimit: 5, quotaUsed: 5, quotaUnit: "usd", quotaPeriod: "none" });
+    vi.stubGlobal("fetch", vi.fn(async () =>
+      Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0.1 }, monthlyUsageCycle: { endAt: "2026-12-09T23:59:59.999Z" } } })));
+    try {
+      expect(await withKey(db, "apify", async (key) => key.secret)).toBe("ap");
+      const [after] = await db.select().from(apiKeys);
+      expect([after.quotaPeriod, after.providerResetsAt?.toISOString()]).toEqual(["none", "2026-12-09T23:59:59.999Z"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("keeps one row when the same key is added twice at once", async () => {

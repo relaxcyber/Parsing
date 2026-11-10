@@ -42,6 +42,8 @@ export const apiKeys = pgTable(
     quotaUnit: text("quota_unit").notNull().default("requests"),
     quotaPeriod: quotaPeriod("quota_period").notNull().default("month"),
     periodStartedAt: ts("period_started_at").notNull().defaultNow(),
+    /** Коли провайдер сам обнулить квоту (напр. кінець місячного циклу Apify) — лише для показу й звірки. */
+    providerResetsAt: ts("provider_resets_at"),
     cooldownUntil: ts("cooldown_until"),
     lastUsedAt: ts("last_used_at"),
     lastSyncedAt: ts("last_synced_at"),
@@ -100,6 +102,8 @@ export const collectRuns = pgTable(
     itemIds: jsonb("item_ids").$type<number[]>().notNull().default([]),
     skipped: integer("skipped").notNull().default(0),
     error: text("error"),
+    /** Зовнішній запуск (Apify run id) — щоб оплачений результат можна було забрати пізніше. */
+    externalRunId: text("external_run_id"),
     startedAt: ts("started_at").notNull().defaultNow(),
     finishedAt: ts("finished_at"),
   },

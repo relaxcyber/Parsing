@@ -11,7 +11,7 @@ const node = process.execPath;
 function desktopDir() {
   if (process.env.DESKTOP_DIR) return process.env.DESKTOP_DIR;
   if (process.platform === "win32") {
-    return execFileSync("powershell", ["-NoProfile", "-Command", "[Environment]::GetFolderPath('Desktop')"], { encoding: "utf8" }).trim();
+    return execFileSync("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding = [Text.Encoding]::UTF8; [Environment]::GetFolderPath('Desktop')"], { encoding: "utf8" }).trim();
   }
   if (process.platform === "linux") {
     try {
