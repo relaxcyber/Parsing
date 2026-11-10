@@ -34,11 +34,11 @@ if (process.platform === "win32") {
   const q = (s) => s.replace(/'/g, "''");
   execFileSync("powershell", ["-NoProfile", "-Command",
     `$s = (New-Object -ComObject WScript.Shell).CreateShortcut('${q(file)}'); ` +
-    `$s.TargetPath = '${q(node)}'; $s.Arguments = '"${q(launch)}"'; $s.WorkingDirectory = '${q(root)}'; ` +
-    `$s.WindowStyle = 7; $s.Description = 'Parsing'; $s.Save()`]);
+    `$s.TargetPath = '${q(node)}'; $s.Arguments = '"${q(launch)}" --pause-on-error'; $s.WorkingDirectory = '${q(root)}'; ` +
+    `$s.WindowStyle = 1; $s.Description = 'Parsing'; $s.Save()`]);
 } else if (process.platform === "darwin") {
   file = path.join(dir, "Parsing.command");
-  writeFileSync(file, `#!/bin/sh\nexec "${node}" "${launch}"\n`);
+  writeFileSync(file, `#!/bin/sh\nexec "${node}" "${launch}" --pause-on-error\n`);
   chmodSync(file, 0o755);
 } else {
   file = path.join(dir, "Parsing.desktop");

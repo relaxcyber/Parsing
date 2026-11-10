@@ -14,6 +14,11 @@ const logFile = path.join(data, "server.log");
 
 const fail = (msg) => {
   console.error(`\n${msg}`);
+  // Запуск із ярлика: без паузи вікно закриється, і помилку ніхто не побачить.
+  if (process.argv.includes("--pause-on-error")) {
+    if (win) spawnSync("cmd", ["/c", "pause"], { stdio: "inherit" });
+    else spawnSync("sh", ["-c", "printf 'Натисніть Enter… '; read _"], { stdio: "inherit" });
+  }
   process.exit(1);
 };
 
@@ -41,7 +46,7 @@ function codeVersion() {
 
 function checkEnv() {
   const file = path.join(root, ".env");
-  if (!existsSync(file)) fail("Немає файлу .env — скопіюйте .env.example у .env і заповніть його.");
+  if (!existsSync(file)) fail("Немає файлу .env — виконайте «npm run setup» у теці проєкту.");
   const env = Object.fromEntries(
     readFileSync(file, "utf8").split(/\r?\n/).filter((l) => /^\s*[A-Z_]+=/.test(l)).map((l) => {
       const i = l.indexOf("=");
@@ -86,7 +91,7 @@ if (!state || stale) {
     for (let i = 0; i < 20 && (await health()); i++) await new Promise((r) => setTimeout(r, 500));
   }
   if (!existsSync(path.join(root, "node_modules")) || stale) run(["install"]);
-  run(["run", "db:migrate"], "\nНайчастіша причина — база даних недоступна: перевірте DATABASE_URL у .env,\nа для локальної бази виконайте «docker compose up -d db».");
+  run(["run", "db:migrate"], "\nНайчастіша причина — база даних недоступна. Перевірте інтернет і чи не призупинено проєкт Supabase;\nзмінити рядок підключення — «npm run setup».");
   if (stale) {
     run(["run", "build"]);
     writeFileSync(builtFile, version);

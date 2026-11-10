@@ -13,7 +13,8 @@
     "db:migrate": "tsx --env-file-if-exists=.env src/db/migrate.ts",
     "keys:import": "tsx --env-file-if-exists=.env src/keys/import.ts",
     "launch": "node scripts/launch.mjs",
-    "shortcut": "node scripts/shortcut.mjs"
+    "shortcut": "node scripts/shortcut.mjs",
+    "setup": "tsx scripts/setup.ts"
   },
   "dependencies": {
     "cheerio": "^1.2.0",
