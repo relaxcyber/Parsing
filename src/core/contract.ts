@@ -19,6 +19,8 @@ export const AuthorSchema = z.object({
   avatarUrl: z.url().optional(),
   bio: z.string().optional(),
   followers: count,
+  /** Посилання з профілю (link-in-bio) — джерело контактів. */
+  links: z.array(z.url()).optional(),
   verified: z.boolean().optional(),
 });
 
@@ -41,6 +43,7 @@ export const ContentItemSchema = z.object({
   title: z.string().optional(),
   text: z.string().optional(),
   lang: z.string().optional(),
+  tags: z.array(z.string()).default([]),
   media: z.array(MediaSchema).default([]),
   metrics: z
     .object({ likes: count, comments: count, shares: count, views: count, score: z.number().optional() })

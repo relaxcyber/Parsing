@@ -13,7 +13,7 @@ export const PRESETS: Preset[] = [
   { slug: "reddit", name: "Reddit API", kind: "scraper" },
   { slug: "openrouter", name: "OpenRouter", kind: "llm", baseUrl: "https://openrouter.ai/api/v1" },
   { slug: "gemini", name: "Google Gemini", kind: "llm", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai" },
-  { slug: "groq", name: "Groq", kind: "llm", baseUrl: "https://api.groq.com/openai/v1" },
+  { slug: "groq", name: "Groq", kind: "llm", baseUrl: "https://api.groq.com/openai/v1", model: "qwen/qwen3.8-27b" },
   { slug: "mistral", name: "Mistral", kind: "llm", baseUrl: "https://api.mistral.ai/v1" },
 ];
 

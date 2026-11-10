@@ -13,6 +13,7 @@
     "db:migrate": "tsx --env-file-if-exists=.env src/db/migrate.ts"
   },
   "dependencies": {
+    "cheerio": "^1.2.0",
     "drizzle-orm": "^0.45.4",
     "next": "^16.4.6",
     "postgres": "^4.1.0",
