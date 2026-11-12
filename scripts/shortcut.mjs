@@ -46,6 +46,8 @@ let file;
 if (process.platform === "win32") {
   file = path.join(dir, "Parsing.lnk");
   windowsShortcut(file, `"${launch}" --pause-on-error`, 1);
+  // Друга кнопка — на випадок, коли дашборд не відкривається: збирає звіт data\diagnostics.txt.
+  windowsShortcut(path.join(dir, "Parsing - діагностика.lnk"), `"${path.join(root, "scripts", "doctor.mjs")}" --pause`, 1);
 } else if (process.platform === "darwin") {
   file = path.join(dir, "Parsing.command");
   writeFileSync(file, `#!/bin/sh\nexec "${node}" "${launch}" --pause-on-error\n`);

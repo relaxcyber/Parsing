@@ -4,6 +4,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { diagnose, reportFile } from "./doctor.mjs";
 
 const root = path.resolve(import.meta.dirname, "..");
 const port = process.env.PORT || "3000";
@@ -16,6 +17,16 @@ const logFile = path.join(data, "server.log");
 const launchLog = path.join(data, "launch.log");
 const background = process.argv.includes("--background");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const lockFile = path.join(data, "launch.lock");
+
+// Автозапуск із теки «Автозавантаження» відкриває вікно консолі; якщо його закрити, поки йде збірка,
+// сервер не стартує. Тож фоновий запуск одразу передає роботу прихованій копії без вікна й виходить.
+if (background && !process.env.PARSING_DETACHED) {
+  spawn(process.execPath, process.argv.slice(1), {
+    cwd: root, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, PARSING_DETACHED: "1" },
+  }).unref();
+  process.exit(0);
+}
 
 /** Журнал запусків: у фоновому режимі вікна немає, і лише він покаже, що пішло не так. */
 function note(msg) {
@@ -24,9 +35,14 @@ function note(msg) {
   } catch {}
 }
 
-const fail = (msg) => {
+const fail = async (msg) => {
   console.error(`\n${msg}`);
   note(`ПОМИЛКА: ${msg}`);
+  rmLock();
+  try {
+    await diagnose({ reason: msg });
+    console.error(`\nЗвіт для діагностики: ${reportFile}`);
+  } catch {}
   // Запуск із ярлика: без паузи вікно закриється, і помилку ніхто не побачить.
   if (process.argv.includes("--pause-on-error")) {
     if (win) spawnSync("cmd", ["/c", "pause"], { stdio: "inherit" });
@@ -56,7 +72,7 @@ async function run(args, hint = "", { retries = 0, delayMs = 0 } = {}) {
     const r = spawnSync("npm", args, { cwd: root, stdio: background ? ["ignore", out, out] : "inherit", shell: win, windowsHide: true });
     if (typeof out === "number") closeSync(out);
     if (r.status === 0) return;
-    if (attempt >= retries) fail(`Команда «npm ${args.join(" ")}» завершилася з помилкою.${hint}`);
+    if (attempt >= retries) await fail(`Команда «npm ${args.join(" ")}» завершилася з помилкою.${hint}`);
     const msg = `«npm ${args.join(" ")}» не вдалася, повторюю через ${Math.round(delayMs / 1000)} с (спроба ${attempt + 2} з ${retries + 1})…`;
     console.log(msg);
     note(msg);
@@ -71,9 +87,9 @@ function codeVersion() {
   return r.status === 0 ? r.stdout.trim() : JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).version;
 }
 
-function checkEnv() {
+async function checkEnv() {
   const file = path.join(root, ".env");
-  if (!existsSync(file)) fail("Немає файлу .env — виконайте «npm run setup» у теці проєкту.");
+  if (!existsSync(file)) await fail("Немає файлу .env — виконайте «npm run setup» у теці проєкту.");
   const env = Object.fromEntries(
     readFileSync(file, "utf8").split(/\r?\n/).filter((l) => /^\s*[A-Z_]+=/.test(l)).map((l) => {
       const i = l.indexOf("=");
@@ -81,8 +97,8 @@ function checkEnv() {
     }),
   );
   const missing = ["DATABASE_URL", "MASTER_KEY", "DASHBOARD_PASSWORD"].filter((k) => !env[k]);
-  if (missing.length) fail(`У .env не заповнено: ${missing.join(", ")}`);
-  if (env.MASTER_KEY.length < 16) fail("MASTER_KEY у .env має бути не коротшим за 16 символів.");
+  if (missing.length) await fail(`У .env не заповнено: ${missing.join(", ")}`);
+  if (env.MASTER_KEY.length < 16) await fail("MASTER_KEY у .env має бути не коротшим за 16 символів.");
 }
 
 /**
@@ -122,6 +138,37 @@ function stopServer() {
   rmSync(pidFile, { force: true });
 }
 
+/** Інший launch.mjs, що зараз запускає сервер: номер процесу з файлу блокування, якщо він живий і свіжий. */
+function otherLaunch() {
+  try {
+    const [pid, at] = readFileSync(lockFile, "utf8").trim().split(" ").map(Number);
+    if (pid === process.pid || Date.now() - at > 20 * 60_000) return null;
+    process.kill(pid, 0);
+    return pid;
+  } catch {
+    return null;
+  }
+}
+function takeLock() {
+  writeFileSync(lockFile, `${process.pid} ${Date.now()}`);
+  process.on("exit", rmLock);
+}
+function rmLock() {
+  try {
+    if (readFileSync(lockFile, "utf8").startsWith(`${process.pid} `)) rmSync(lockFile, { force: true });
+  } catch {}
+}
+async function waitForOtherLaunch() {
+  if (otherLaunch() == null) return false;
+  console.log("Сервер уже запускається (автозапуск) — чекаю…");
+  note("Інший запуск уже триває — чекаю на нього.");
+  while (otherLaunch() != null) {
+    if (await health()) return true;
+    await sleep(2000);
+  }
+  return true;
+}
+
 const logTail = () => (existsSync(logFile) ? readFileSync(logFile, "utf8").trim().split("\n").slice(-15).join("\n") : "(журнал порожній)");
 
 mkdirSync(data, { recursive: true });
@@ -132,7 +179,7 @@ try {
 const version = codeVersion();
 const built = existsSync(builtFile) ? readFileSync(builtFile, "utf8").trim() : "";
 let state = await health();
-if (state?.foreign) fail(`Порт ${port} зайнятий іншою програмою. Закрийте її або задайте інший порт змінною PORT.`);
+if (state?.foreign) await fail(`Порт ${port} зайнятий іншою програмою. Закрийте її або задайте інший порт змінною PORT.`);
 if (background) note(state ? "Автозапуск: сервер уже працює." : "Автозапуск: запускаю сервер…");
 
 if (process.argv.includes("--stop")) {
@@ -143,7 +190,20 @@ if (process.argv.includes("--stop")) {
 
 const stale = built !== version || !existsSync(path.join(root, ".next", "BUILD_ID"));
 if (!state || stale) {
-  checkEnv();
+  // Після ввімкнення ПК автозапуск і клік по ярлику можуть стартувати разом. Другий запуск не чіпає
+  // перший (інакше два npm install зіпсували б залежності), а чекає, поки той підніме сервер.
+  if (await waitForOtherLaunch()) state = await health();
+}
+if (!state || stale) {
+  takeLock();
+  // Ярлик натиснули, а сервера немає — значить, автозапуск після ввімкнення ПК не спрацював.
+  // Знімок стану (до нашого втручання) допоможе зрозуміти чому.
+  if (!state && !background && !process.argv.includes("--no-diagnose")) {
+    try {
+      await diagnose({ reason: "сервер не працював, коли натиснули ярлик" });
+    } catch {}
+  }
+  await checkEnv();
   // Сервер, що не відповідає (завис чи ще стартує), або старий після оновлення коду — зупиняємо,
   // інакше другий сторож намагався б зайняти той самий порт.
   if (state) console.log("Код оновився — перезапускаю сервер…");
@@ -169,14 +229,14 @@ if (!state || stale) {
 
   state = null;
   for (let i = 0; i < 90 && !(state = await health()); i++) await sleep(1000);
-  if (!state) fail(`Сервер не відповів за півтори хвилини. Останні рядки data/server.log:\n${logTail()}`);
+  if (!state) await fail(`Сервер не відповів за півтори хвилини. Останні рядки data/server.log:\n${logTail()}`);
 }
 // База може прокинутися не одразу (Supabase після простою, мережа після ввімкнення ПК).
 for (let i = 0; !state.ok && i < (background ? 20 : 2); i++) {
   await sleep(background ? 15_000 : 5_000);
   state = (await health()) ?? state;
 }
-if (!state.ok) fail(`Сервер запущено, але є проблеми:\n- ${state.problems.join("\n- ")}`);
+if (!state.ok) await fail(`Сервер запущено, але є проблеми:\n- ${state.problems.join("\n- ")}`);
 if (background) note(`Сервер працює: ${url}`);
 
 if (process.env.NO_OPEN !== "1" && !background) {

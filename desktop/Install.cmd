@@ -57,6 +57,7 @@ if errorlevel 1 goto failed
 echo.
 echo Готово. Сервер тепер запускається сам після ввімкнення комп'ютера:
 echo дашборд відкривається за адресою http://127.0.0.1:3000 або ярликом Parsing.
+echo Якщо не відкривається - ярлик "Parsing - діагностика" збере звіт data\diagnostics.txt.
 pause
 exit /b 0
 

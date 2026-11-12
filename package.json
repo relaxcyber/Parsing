@@ -14,6 +14,7 @@
     "keys:import": "tsx --env-file-if-exists=.env src/keys/import.ts",
     "launch": "node scripts/launch.mjs",
     "shortcut": "node scripts/shortcut.mjs",
+    "doctor": "node scripts/doctor.mjs",
     "setup": "tsx scripts/setup.ts"
   },
   "dependencies": {
