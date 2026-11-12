@@ -20,7 +20,7 @@ type Run = { code: number | "ENOENT" | "TIMEOUT"; output: string };
 
 function run(args: string[], timeoutMs: number): Promise<Run> {
   return new Promise((resolve) => {
-    execFile(bin(), args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (err: any, stdout, stderr) => {
+    execFile(/*turbopackIgnore: true*/ bin(), args, { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (err: any, stdout, stderr) => {
       const output = `${stdout}\n${stderr}`;
       if (!err) resolve({ code: 0, output });
       else if (err.code === "ENOENT") resolve({ code: "ENOENT", output });

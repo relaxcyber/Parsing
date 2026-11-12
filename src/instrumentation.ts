@@ -1,18 +1,4 @@
-/** Виконується один раз під час старту сервера. */
+/** Виконується один раз під час старту сервера. Код для Node.js — в окремому модулі, щоб не потрапив у збірку Edge. */
 export async function register() {
-  if (process.env.NEXT_RUNTIME !== "nodejs" || !process.env.DATABASE_URL) return;
-  // Забута обробка помилки десь у фоні (обрив з’єднання з базою тощо) не повинна вбивати весь дашборд:
-  // записуємо її в журнал і працюємо далі.
-  process.on("unhandledRejection", (e) => console.error("Необроблена помилка у фоні:", e));
-  try {
-    const [{ getDb }, { failInterruptedRuns }, search, scrape] = await Promise.all([
-      import("@/db/client"), import("@/collect"), import("@/search/pipeline"), import("@/scrape/jobs"),
-    ]);
-    await failInterruptedRuns(getDb());
-    await search.requeueInterrupted(getDb());
-    await scrape.requeueInterruptedJobs(getDb());
-    search.startSearchWorker(getDb, [scrape.runNextScrapeJob]);
-  } catch (e) {
-    console.error("Не вдалося запустити фонові задачі:", e);
-  }
+  if (process.env.NEXT_RUNTIME === "nodejs") await import("./instrumentation-node");
 }
