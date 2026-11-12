@@ -85,11 +85,38 @@ function checkEnv() {
   if (env.MASTER_KEY.length < 16) fail("MASTER_KEY у .env має бути не коротшим за 16 символів.");
 }
 
-function stopServer() {
-  if (!existsSync(pidFile)) return;
+/**
+ * Номер процесу сервера з файлу — лише якщо це справді наш процес (node). Після перезавантаження ПК
+ * у файлі лишається старий номер, і Windows може віддати його іншій програмі: її чіпати не можна.
+ */
+function ourPid() {
+  if (!existsSync(pidFile)) return null;
   const pid = Number(readFileSync(pidFile, "utf8"));
+  let ours = false;
+  if (Number.isInteger(pid) && pid > 0) {
+    if (win) {
+      const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", windowsHide: true });
+      ours = /"node(\.exe)?"/i.test(r.stdout ?? "");
+    } else {
+      try {
+        ours = /node|next/.test(readFileSync(`/proc/${pid}/cmdline`, "utf8"));
+      } catch {
+        try {
+          process.kill(pid, 0); // без /proc (macOS): лише перевірка, що процес живий
+          ours = true;
+        } catch {}
+      }
+    }
+  }
+  if (!ours) rmSync(pidFile, { force: true });
+  return ours ? pid : null;
+}
+
+function stopServer() {
+  const pid = ourPid();
+  if (pid == null) return;
   try {
-    if (win) spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"]);
+    if (win) spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { windowsHide: true });
     else process.kill(-pid, "SIGTERM"); // уся група: сторож і сам next
   } catch {}
   rmSync(pidFile, { force: true });
@@ -106,9 +133,6 @@ const version = codeVersion();
 const built = existsSync(builtFile) ? readFileSync(builtFile, "utf8").trim() : "";
 let state = await health();
 if (state?.foreign) fail(`Порт ${port} зайнятий іншою програмою. Закрийте її або задайте інший порт змінною PORT.`);
-// Після перезавантаження ПК у файлі лишається номер процесу, якого вже немає; Windows може віддати
-// цей номер іншій програмі, і «--stop» убив би її.
-if (!state) rmSync(pidFile, { force: true });
 if (background) note(state ? "Автозапуск: сервер уже працює." : "Автозапуск: запускаю сервер…");
 
 if (process.argv.includes("--stop")) {
@@ -120,8 +144,10 @@ if (process.argv.includes("--stop")) {
 const stale = built !== version || !existsSync(path.join(root, ".next", "BUILD_ID"));
 if (!state || stale) {
   checkEnv();
-  if (state) {
-    console.log("Код оновився — перезапускаю сервер…");
+  // Сервер, що не відповідає (завис чи ще стартує), або старий після оновлення коду — зупиняємо,
+  // інакше другий сторож намагався б зайняти той самий порт.
+  if (state) console.log("Код оновився — перезапускаю сервер…");
+  if (state || ourPid() != null) {
     stopServer();
     for (let i = 0; i < 20 && (await health()); i++) await sleep(500);
   }

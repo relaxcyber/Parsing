@@ -7,7 +7,10 @@ import { median, type PostFacts } from "./posts";
  */
 
 const AD_TEXT =
-  /(#(ad|ads|advert|sponsored|spon|partner|partnership|paidpartnership|gifted|collab|амбасадор|реклама|ambassador)\b|paid partnership|in partnership with|sponsored by|thanks to @|thank you @|use (my )?code|promo ?code|discount code|\bcode:? ?[A-Z0-9]{4,}\b|affiliate link|commissions? earned|#commissionsearned|amazon\.com\/shop|amzn\.to|liketk\.it|shopmy\.us|рекламн|промокод|співпраця з|сотрудничеств)/i;
+  /(#(ad|ads|advert|sponsored|spon|partner|partnership|paidpartnership|gifted|collab|амбасадор|реклама|ambassador)\b|paid partnership|in partnership with|sponsored by|thanks to @|thank you @|(?:use (?:my )?code|promo ?code|discount code)(?::? ?[A-Z0-9]{4,}\b)?|affiliate link|commissions? earned|#commissionsearned|amazon\.com\/shop|amzn\.to|liketk\.it|shopmy\.us|рекламн|промокод|співпраця з|сотрудничеств)/i;
+
+/** «code ANNA10» — лише з кодом великими літерами: інакше «dress code» теж стало б рекламою. */
+const CODE = /\b[Cc]ode:? ?[A-Z][A-Z0-9]{3,}\b/;
 
 export type AdPost = { url: string; reason: string; brands: string[]; likes: number | null };
 export type AdsReport = {
@@ -29,7 +32,7 @@ export function detectAd(p: PostFacts, creator: string): AdPost | null {
   if (p.paid) reason = "позначка «Платне партнерство»";
   else if (others(p.coauthors).length) reason = `спільний допис з @${others(p.coauthors)[0]}`;
   else {
-    const m = p.caption.match(AD_TEXT);
+    const m = p.caption.match(AD_TEXT) ?? p.caption.match(CODE);
     if (m) reason = `у підписі: «${m[0].trim()}»`;
   }
   return reason ? { url: p.url, reason, brands, likes: p.likes } : null;

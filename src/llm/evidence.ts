@@ -10,7 +10,7 @@ export const normText = (s: string) =>
 /** Цитата знайдена, якщо кожна її частина (модель може скорочувати через «…») є в корпусі. */
 export function quoteFound(quote: string, corpus: string): boolean {
   const parts = quote.split(/…|\.\.\./).map(normText).filter((p) => p.length > 0);
-  if (parts.length === 0 || parts.join("").length < 4) return false;
+  if (parts.length === 0 || parts.join("").length < 3) return false; // «NYC» — уже доказ, «ab» — ні
   const hay = ` ${normText(corpus)} `;
   return parts.every((p) => hay.includes(p));
 }

@@ -43,9 +43,8 @@ async function callProvider(db: Db, p: ReadyProvider, messages: ChatMessage[], p
         signal: AbortSignal.timeout(90_000),
       });
       if (!res.ok) {
-        const retry = Number(res.headers.get("retry-after"));
         const text = (await res.text().catch(() => "")).slice(0, 300);
-        throw new ProviderHttpError(res.status, `${p.slug}: HTTP ${res.status}: ${text}`, Number.isFinite(retry) && retry > 0 ? Math.ceil(retry) : undefined);
+        throw new ProviderHttpError(res.status, `${p.slug}: HTTP ${res.status}: ${text}`, retryAfter(res.headers.get("retry-after"), text));
       }
       const body = await res.json();
       const content = body?.choices?.[0]?.message?.content;
@@ -54,6 +53,17 @@ async function callProvider(db: Db, p: ReadyProvider, messages: ChatMessage[], p
     },
     { purpose, retryTransient: true },
   );
+}
+
+/**
+ * Скільки чекати після 429: заголовок retry-after, а якщо його немає — з тексту помилки
+ * (Groq пише «Please try again in 2.94s» чи «in 1m30.5s»). Безкоштовні ліміти хвилинні: зазвичай секунди.
+ */
+export function retryAfter(header: string | null, body: string): number | undefined {
+  const h = Number(header);
+  if (Number.isFinite(h) && h > 0) return Math.ceil(h);
+  const m = body.match(/try again in (?:(\d+)m)?\s*([\d.]+)s/i);
+  return m ? Math.ceil(Number(m[1] ?? 0) * 60 + Number(m[2])) : undefined;
 }
 
 /** Дістає JSON із відповіді, навіть якщо модель обгорнула його текстом, ```-блоком чи міркуваннями <think>. */
@@ -137,7 +147,14 @@ export async function chatJsonMeta<T>(db: Db, schema: z.ZodType<T>, messages: Ch
           if (e.retryAt && (!retryAt || e.retryAt < retryAt)) retryAt = e.retryAt;
           break; // у цього провайдера ключів немає — наступний
         }
-        if (e instanceof ProviderHttpError) break;
+        if (e instanceof ProviderHttpError) {
+          // Хвилинний ліміт: запам’ятовуємо, коли можна повторити (ключ уже поставлено на паузу).
+          if (e.status === 429) {
+            const at = new Date(Date.now() + (e.retryAfterSec ?? 60) * 1000);
+            if (!retryAt || at < retryAt) retryAt = at;
+          }
+          break;
+        }
         // Невалідний JSON або схема: показуємо моделі її помилки й просимо виправити.
         if (reply) {
           convo = [...messages, { role: "assistant", content: reply.slice(0, 4000) },

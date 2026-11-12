@@ -437,6 +437,32 @@ describe("search pipeline", () => {
     expect(calls.profileInputs.flat().filter((u) => u === "anna")).toHaveLength(1);
   });
 
+  it("autopilot stops as soon as the lead target is met and respects the budget", async () => {
+    const db = await testDb();
+    await addTestKey(db, "apify", "ap");
+    await addTestKey(db, "groq", "gq");
+    const { mock, calls } = await world([...posts, post("Q1", "zoe", "UGC creator skincare", "second")], profiles, { pages, llm });
+    vi.stubGlobal("fetch", mock);
+    const [s] = await newSearch(db, { hashtags: ["ugccreator", "second"], targetLeads: 1 });
+    await runNextSearch(db);
+    const [done] = await db.select().from(searches).where(eq(searches.id, s.id));
+    expect(done.stats).toMatchObject({ leads: 1, waves: 1 });
+    expect(calls.hashtag).toBe(1); // другий хештег не знадобився — за нього не платили
+    expect(done.stats.notes).toContain("Мету досягнуто: 1 готових лідів");
+
+    // Бюджет $0.03: на хештеги по 10 дописів (~$0.026) вистачає одному, другий пропущено.
+    const [b] = await newSearch(db, { name: "Бюджет", hashtags: ["second", "third"], budgetUsd: 0.03, auditLimit: 0 });
+    await runNextSearch(db);
+    const [budget] = await db.select().from(searches).where(eq(searches.id, b.id));
+    expect(budget.status).toBe("done");
+    expect(budget.stats.notes).toContain("#third: пропущено — не вистачає бюджету");
+    expect(calls.hashtag).toBe(2); // + лише #second
+    for (const c of await db.select().from(creators)) {
+      await rm(collagePath(c.id), { force: true });
+      await rm(deepCollagePath(c.id), { force: true });
+    }
+  });
+
   it("records the failure reason and estimates cost", async () => {
     const db = await testDb(); // немає ключа Apify
     const [s] = await newSearch(db);

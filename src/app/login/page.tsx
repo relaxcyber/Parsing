@@ -6,13 +6,13 @@ export const dynamic = "force-dynamic";
 async function signIn(form: FormData) {
   "use server";
   const r = await login(String(form.get("password") ?? ""));
-  redirect(r.ok ? "/keys" : `/login?error=${r.reason}`);
+  redirect(r.ok ? "/search" : `/login?error=${r.reason}`);
 }
 
 const wait = (sec: number) => (sec >= 90 ? `${Math.ceil(sec / 60)} хв` : `${sec} с`);
 
 export default async function LoginPage({ searchParams }: { searchParams: Promise<{ error?: string }> }) {
-  if (await isAuthed()) redirect("/keys");
+  if (await isAuthed()) redirect("/search");
   const { error } = await searchParams;
   const locked = loginLockSeconds();
   return (

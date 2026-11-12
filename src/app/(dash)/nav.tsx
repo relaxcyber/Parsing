@@ -4,10 +4,14 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const LINKS = [
-  { href: "/keys", label: "Ключі та ліміти" },
   { href: "/search", label: "Пошук креаторів" },
+  { href: "/creators", label: "Креатори" },
+  { href: "/report", label: "Звіт про роботу" },
+  { href: "/quality", label: "Точність оцінок" },
   { href: "/scrape", label: "Парсинг сайтів" },
   { href: "/collect", label: "Разовий збір" },
+  { href: "/keys", label: "Ключі та ліміти" },
+  { href: "/help", label: "Довідка" },
 ];
 
 export function Nav() {

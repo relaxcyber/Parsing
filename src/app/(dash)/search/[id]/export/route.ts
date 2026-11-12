@@ -25,15 +25,20 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   const picked = rows.filter((r) => !onlyEmail || r.c.emails.length > 0);
 
   const csv = toCsv(
-    ["email", "first_name", "username", "profile_url", "followers", "score", "fit", "readiness", "quality", "lead", "email_status", "email_source",
-      "last_post", "aesthetic", "affiliate", "portfolio", "rates", "other_emails", "links", "bio", "reasons"],
+    ["email", "first_name", "username", "profile_url", "followers", "score", "fit", "readiness", "quality", "trust", "fake_risk", "er_likes_pct",
+      "ad_posts", "ad_quality", "lead", "email_status", "email_source", "last_post", "aesthetic", "source", "outreach_status", "review",
+      "affiliate", "portfolio", "rates", "other_emails", "links", "bio", "reasons"],
     picked.map(({ cand, c }) => {
       const k = contacts.find((x) => x.creatorId === c.id && x.email === c.emails[0]);
       const audit = c.audit as { aesthetic?: string } | null;
+      const ads = c.ads as { adPosts?: number } | null;
       return [
         c.emails[0] ?? "", (c.displayName ?? "").split(/[\s|,]/)[0] ?? "", c.username, `https://www.instagram.com/${c.username}/`, c.followers ?? "",
-        Math.round(cand.score), cand.fit ?? "", cand.readiness ?? "", cand.quality ?? "", cand.lead ? "yes" : "no", k?.status ?? "", k?.sourceUrl ?? "",
-        c.lastPostAt ? c.lastPostAt.toISOString().slice(0, 10) : "", audit?.aesthetic ?? "", c.affiliate.join("; "), c.portfolio.join("; "),
+        Math.round(cand.score), cand.fit ?? "", cand.readiness ?? "", cand.quality ?? "", cand.trust ?? "", c.trustRisk ?? "",
+        c.erLikes != null ? Math.round(c.erLikes * 10000) / 100 : "", ads?.adPosts ?? "", c.adQuality ?? "",
+        cand.lead ? "yes" : "no", k?.status ?? "", k?.sourceUrl ?? "",
+        c.lastPostAt ? c.lastPostAt.toISOString().slice(0, 10) : "", audit?.aesthetic ?? "", cand.source ?? "", c.outreachStatus, c.reviewNote ?? "",
+        c.affiliate.join("; "), c.portfolio.join("; "),
         c.rates.map((r) => r.title).join("; "), c.emails.slice(1).join("; "), c.links.join("; "), c.bio ?? "", cand.reasons.join("; "),
       ];
     }),

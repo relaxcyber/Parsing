@@ -35,8 +35,11 @@ const COMMENTS_FRESH_MS = 30 * DAY;
 /** Пам’ять відмов: магазин чи закритий профіль не перевіряємо (і не оплачуємо) знову 90 днів. */
 const HARD_REJECT_MS = 90 * DAY;
 const PROFILE_CHUNK = 50;
-/** Скільки авторів за пошук читає модель-аналітик (кешується, тож повтор нічого не коштує). */
-const ANALYSIS_LIMIT = 80;
+/**
+ * Скільки авторів за пошук читає модель-аналітик: на 10 більше, ніж візуальних аудитів. Безкоштовний
+ * Groq дає ~1000 вихідних токенів на хвилину (3–4 профілі), тож більше — це вже десятки хвилин.
+ */
+const analysisLimit = (auditLimit: number) => Math.max(10, auditLimit + 10);
 const COMMENT_POSTS = 3;
 const COMMENTS_PER_POST = 10;
 /** Оцінка ближче за цю відстань до порога — «біля порога»: потрібна друга думка або ваш погляд. */
@@ -125,7 +128,8 @@ async function withLlm<T>(ctx: Ctx, fn: () => Promise<T>): Promise<T | Error | n
     try {
       return await fn();
     } catch (e) {
-      if (e instanceof LlmUnavailableError && e.retryAt && e.retryAt.getTime() - Date.now() < 90_000 && attempt < 3) {
+      // Хвилинний ліміт — чекаємо й повторюємо; якщо модель недоступна надовго — пропускаємо кроки з нею.
+      if (e instanceof LlmUnavailableError && e.retryAt && e.retryAt.getTime() - Date.now() < 90_000 && attempt < 5) {
         await sleep(Math.max(1000, e.retryAt.getTime() - Date.now() + 500));
         continue;
       }
@@ -188,7 +192,7 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
   const ctx: Ctx = {
     db, search, criteria: criteriaOf(search), weights: weightsOf(search), stats: { posts: 0 }, now: new Date(), norms: await loadNorms(db),
     spent: 0, budget: search.budgetUsd ?? null,
-    left: { shortlist: search.maxProfiles, audits: search.auditLimit, deep: search.deepLimit, comments: search.commentsLimit, analysis: ANALYSIS_LIMIT },
+    left: { shortlist: search.maxProfiles, audits: search.auditLimit, deep: search.deepLimit, comments: search.commentsLimit, analysis: analysisLimit(search.auditLimit) },
     authors: new Map(), series: new Set(), qualified: new Set(), done: new Set(), llmDown: null, notes: [],
   };
   const { stats } = ctx;
