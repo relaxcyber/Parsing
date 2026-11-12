@@ -29,8 +29,29 @@ rem Працюючий сервер тримає файли залежносте
 if exist "%DIR%\scripts\launch.mjs" node "%DIR%\scripts\launch.mjs" --stop >nul 2>nul
 rem npm install інколи переписує package-lock.json, і тоді git pull відмовляється оновлювати.
 git -C "%DIR%" checkout -- package-lock.json >nul 2>nul
-git -C "%DIR%" pull --ff-only
+git -C "%DIR%" fetch origin %BRANCH%
 if errorlevel 1 goto failed
+rem Звичайний випадок: локальна копія відстає від GitHub - просто перемотуємо вперед.
+git -C "%DIR%" merge-base --is-ancestor HEAD origin/%BRANCH% >nul 2>nul
+if errorlevel 1 goto diverged
+git -C "%DIR%" checkout -q -B %BRANCH% origin/%BRANCH%
+if errorlevel 1 goto diverged
+goto deps
+
+:diverged
+rem Локальна копія розійшлася з GitHub (є свої коміти чи зміни, інша гілка). Нічого не видаляємо:
+rem усе локальне зберігаємо в гілці backup-ДАТА (незакомічене - у git stash), а проєкт ставимо
+rem точно як на GitHub. Файли .env і data\ git не відстежує - вони лишаються як були.
+for /f %%i in ('node -e "console.log(new Date().toISOString().slice(0,16).match(/\d/g).join(String()))"') do set STAMP=%%i
+echo Локальна копія відрізняється від GitHub. Зберігаю її в гілці backup-%STAMP% ...
+echo Локальні коміти, яких немає на GitHub:
+git -C "%DIR%" log --oneline origin/%BRANCH%..HEAD
+git -C "%DIR%" branch backup-%STAMP%
+if errorlevel 1 goto failed
+git -C "%DIR%" stash push -u -m "Install backup-%STAMP%" >nul 2>nul
+git -C "%DIR%" checkout -q -f -B %BRANCH% origin/%BRANCH%
+if errorlevel 1 goto failed
+echo Готово: проєкт оновлено, попередній стан - у гілці backup-%STAMP%.
 
 :deps
 cd /d "%DIR%"
