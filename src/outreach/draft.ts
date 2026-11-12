@@ -17,7 +17,7 @@ import { chatJsonMeta, dataBlock, GUARD } from "@/llm/client";
  * Надсилаєте ви самі: застосунок листів не відправляє.
  */
 
-export const DRAFT_VERSION = "draft-v1";
+export const DRAFT_VERSION = "draft-v2";
 export const SENDER = "{{sender_name}}";
 
 export type FactSheet = {
@@ -102,7 +102,8 @@ ${GUARD}
 Rules:
 - Use ONLY facts from the FACTS block. Never invent numbers, prices, dates, product names, links, results or compliments that FACTS does not support.
 - Mention the creator's post from FACTS.post in a natural, specific way (what it is about), so the message is clearly not a mass mailing.
-- If FACTS.brand.offer is empty, do not name any price or budget: ask the creator to share their rates.
+- If FACTS.brand.offer is empty, do not name any price or budget: simply ask the creator to share their rates (never mention that a budget is missing).
+- Praise only what FACTS states. Do not add judgements such as "high-converting", "experienced" or "your audience loves you".
 - If FACTS.brand.name is empty, do not invent a brand name; describe the product from the brief instead.
 - Address the creator by FACTS.creator.name if present, otherwise without a name. Sign with ${SENDER}.
 - Write on behalf of the brand team in the first person plural ("we"), so that no verb or adjective reveals the sender's gender.
