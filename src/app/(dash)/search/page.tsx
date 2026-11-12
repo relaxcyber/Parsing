@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { desc } from "drizzle-orm";
 import { getDb } from "@/db/client";
-import { searches, searchTemplates } from "@/db/schema";
+import { clients, searchTemplates, searches } from "@/db/schema";
 import { BUILTIN_TEMPLATES } from "@/search/templates";
 import { ConfirmButton } from "../keys/confirm-button";
 import { deleteTemplate } from "./actions";
@@ -15,9 +15,10 @@ const usd = (n: number | undefined) => (n == null ? "—" : `$${n.toFixed(2).rep
 export default async function SearchPage({ searchParams }: { searchParams: Promise<{ msg?: string }> }) {
   const { msg } = await searchParams;
   const db = getDb();
-  const [rows, saved] = await Promise.all([
+  const [rows, saved, clientRows] = await Promise.all([
     db.select().from(searches).orderBy(desc(searches.createdAt)).limit(50),
     db.select().from(searchTemplates).orderBy(searchTemplates.name),
+    db.select({ id: clients.id, name: clients.name }).from(clients).orderBy(clients.name),
   ]);
   const active = rows.some((r) => r.status === "queued" || r.status === "running");
   const templates = [...BUILTIN_TEMPLATES, ...saved.map((t) => ({ name: t.name, data: t.data }))];
@@ -34,7 +35,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
 
       <section className="card">
         <h2>Новий пошук</h2>
-        <SearchForm templates={templates} />
+        <SearchForm templates={templates} clients={clientRows} />
         {saved.length > 0 && (
           <div className="muted" style={{ marginTop: 12 }}>
             Ваші шаблони:{" "}

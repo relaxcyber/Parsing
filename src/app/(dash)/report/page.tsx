@@ -25,8 +25,8 @@ export default async function WorkReport() {
     db.select({ followers: creators.followers, rates: creators.rates }).from(creators).where(sql`jsonb_array_length(${creators.rates}) > 0`),
   ]);
   const st = (s: string) => statuses.find((x) => x.s === s)?.n ?? 0;
-  const contacted = st("contacted") + st("replied") + st("in_work") + st("declined");
-  const replied = st("replied") + st("in_work");
+  const contacted = st("contacted") + st("replied") + st("in_work") + st("posted") + st("declined");
+  const replied = st("replied") + st("in_work") + st("posted");
   const spent = costs.reduce((a, r) => a + (r.stats.costUsd ?? 0), 0);
 
   const draftCreators = drafts.map((d) => d.creatorId);
@@ -39,7 +39,7 @@ export default async function WorkReport() {
     if (!s || s === "new") continue;
     const e = byStyle.get(d.style) ?? { sent: 0, replied: 0 };
     e.sent++;
-    if (s === "replied" || s === "in_work") e.replied++;
+    if (s === "replied" || s === "in_work" || s === "posted") e.replied++;
     byStyle.set(d.style, e);
   }
 
@@ -53,14 +53,14 @@ export default async function WorkReport() {
 
   const steps = [
     ["Знайдено авторів", funnel.found], ["Пройшли відбір", funnel.qualified], ["Готові ліди", funnel.leads],
-    ["Написали", contacted], ["Відповіли", replied], ["У роботі", st("in_work")],
+    ["Написали", contacted], ["Відповіли", replied], ["У роботі", st("in_work") + st("posted")], ["Опублікували", st("posted")],
   ] as const;
 
   return (
     <>
       <div className="actions no-print" style={{ float: "right" }}><PrintButton /></div>
       <h1>Звіт про роботу</h1>
-      <p className="sub">Завершених пошуків: {searchesDone}. Витрачено в Apify: {usd(spent)}{funnel.leads ? ` · ${usd(spent / funnel.leads)} за готовий лід` : ""}{st("in_work") ? ` · ${usd(spent / st("in_work"))} за автора в роботі` : ""}.</p>
+      <p className="sub">Завершених пошуків: {searchesDone}. Витрачено в Apify: {usd(spent)}{funnel.leads ? ` · ${usd(spent / funnel.leads)} за готовий лід` : ""}{st("in_work") + st("posted") ? ` · ${usd(spent / (st("in_work") + st("posted")))} за автора в роботі` : ""}{st("posted") ? ` · ${usd(spent / st("posted"))} за опублікований допис` : ""}.</p>
 
       <section className="card">
         <h2>Воронка</h2>

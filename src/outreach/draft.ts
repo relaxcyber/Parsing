@@ -40,7 +40,7 @@ export type Draft = z.infer<typeof DraftSchema>;
 const LANG_NAMES: Record<string, string> = { en: "English", uk: "Ukrainian", ru: "Russian", pl: "Polish", de: "German", es: "Spanish" };
 
 /** Перше ім’я з показуваного імені, якщо воно схоже на ім’я людини; інакше — без імені. */
-function firstName(displayName: string | null): string | null {
+export function firstName(displayName: string | null): string | null {
   const w = displayName?.replace(/[^\p{L}\s'-]/gu, " ").trim().split(/\s+/)[0];
   return w && w.length >= 2 && w.length <= 20 && /^\p{Lu}/u.test(w) ? w : null;
 }
@@ -111,14 +111,23 @@ Rules:
 - If an EXAMPLE is given, match its tone and length, but never copy facts from it.
 Return ONLY JSON: {"subject_a": "...", "subject_b": "... (a different angle)", "email": "...", "dm": "...", "followup_1": "... (after 3-4 days)", "followup_2": "... (after a week, last one)"}`;
 
-export async function generateDraft(db: Db, creatorId: number, searchId: number | null): Promise<{ id: number; issues: string[] }> {
+export type DraftOverrides = {
+  /** Бренд і умови з правил клієнта замість полів пошуку. */
+  brand?: Pick<Search, "brandName" | "offer" | "brief">;
+  language?: string;
+};
+
+export async function generateDraft(
+  db: Db, creatorId: number, searchId: number | null, overrides: DraftOverrides = {},
+): Promise<{ id: number; issues: string[]; data: Draft; language: string }> {
   const [c] = await db.select().from(creators).where(eq(creators.id, creatorId));
   if (!c) throw new Error("Автора не знайдено");
   const [s] = searchId ? await db.select().from(searches).where(eq(searches.id, searchId)) : [];
   const [profile] = await db.select({ raw: contentItems.raw }).from(contentItems)
     .where(and(eq(contentItems.source, c.platform), eq(contentItems.externalId, `profile:${c.username}`)));
-  const language = s?.outreachLanguage ?? "en";
-  const facts = buildFacts(c, s ?? { brandName: null, offer: null, brief: null }, profile?.raw);
+  const language = overrides.language ?? s?.outreachLanguage ?? "en";
+  const brand = overrides.brand ?? s ?? { brandName: null, offer: null, brief: null };
+  const facts = buildFacts(c, brand, profile?.raw);
   const example = s?.letterExample?.trim();
   const user = [
     dataBlock("facts", JSON.stringify(facts, null, 1)),
@@ -144,5 +153,5 @@ export async function generateDraft(db: Db, creatorId: number, searchId: number 
     creatorId, searchId: s?.id ?? null, language, style: example ? "example" : "standard",
     data: res.data, facts: { ...facts, version: DRAFT_VERSION, model: res.model } as unknown as Record<string, unknown>, issues,
   }).returning({ id: outreachDrafts.id });
-  return { id: row.id, issues };
+  return { id: row.id, issues, data: res.data, language };
 }

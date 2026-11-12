@@ -6,6 +6,8 @@ import { usePathname } from "next/navigation";
 const LINKS = [
   { href: "/search", label: "Пошук креаторів" },
   { href: "/creators", label: "Креатори" },
+  { href: "/inbox", label: "Листування" },
+  { href: "/clients", label: "Клієнти" },
   { href: "/report", label: "Звіт про роботу" },
   { href: "/quality", label: "Точність оцінок" },
   { href: "/scrape", label: "Парсинг сайтів" },

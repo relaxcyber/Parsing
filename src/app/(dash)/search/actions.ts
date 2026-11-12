@@ -40,7 +40,7 @@ const SearchForm = z.object({
   auditLimit: z.coerce.number().int().min(0).max(150),
   deepLimit: z.coerce.number().int().min(0).max(50),
   commentsLimit: z.coerce.number().int().min(0).max(50),
-  targetLeads: optionalInt, budgetUsd: optionalNum, repeatDays: optionalInt,
+  targetLeads: optionalInt, budgetUsd: optionalNum, repeatDays: optionalInt, clientId: optionalInt,
   excludeContacted: z.unknown().transform((v) => v === "on"),
   "c.followers": mode, "c.country": mode, "c.language": mode, "c.activity": mode, "c.er": mode, "c.email": mode, "c.ads": mode, "c.trust": mode, "c.formats": mode,
   activityDays: z.coerce.number().int().min(1).max(365).catch(DEFAULT_CRITERIA.activity.days),
@@ -68,7 +68,7 @@ export async function createSearch(form: FormData) {
     outreachLanguage: d.outreachLanguage, hashtags: d.hashtags, keywords: d.keywords, stopWords: d.stopWords, sources,
     postsPerTag: d.postsPerTag, maxProfiles: d.maxProfiles, minFollowers: d.minFollowers, maxFollowers: d.maxFollowers,
     countries: d.countries, languages: d.languages, auditLimit: d.auditLimit, deepLimit: d.deepLimit, commentsLimit: d.commentsLimit,
-    targetLeads: d.targetLeads || null, budgetUsd: d.budgetUsd || null, repeatDays: d.repeatDays || null, excludeContacted: d.excludeContacted,
+    clientId: d.clientId || null, targetLeads: d.targetLeads || null, budgetUsd: d.budgetUsd || null, repeatDays: d.repeatDays || null, excludeContacted: d.excludeContacted,
     criteria: {
       followers: m("c.followers"), country: m("c.country"), language: m("c.language"),
       activity: { mode: m("c.activity"), days: d.activityDays }, er: { mode: m("c.er"), minPct: d.erMinPct },
@@ -160,7 +160,7 @@ export async function setVerdict(form: FormData) {
 /** Статус роботи з автором: написали, відповів, у роботі, відмова. */
 export async function setOutreachStatus(form: FormData) {
   await requireAuth();
-  const status = z.enum(["new", "contacted", "replied", "in_work", "declined"]).parse(form.get("status")) as OutreachStatus;
+  const status = z.enum(["new", "contacted", "replied", "in_work", "posted", "declined"]).parse(form.get("status")) as OutreachStatus;
   const note = String(form.get("note") ?? "").trim().slice(0, 500) || null;
   await getDb().update(creators).set({ outreachStatus: status, outreachAt: new Date(), ...(form.has("note") ? { outreachNote: note } : {}) })
     .where(eq(creators.id, id(form)));

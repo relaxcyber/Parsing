@@ -201,7 +201,7 @@ export const creators = pgTable(
 ).enableRLS();
 
 export type CreatorRate = { title: string; amount: number; currency: string; sourceUrl: string };
-export type OutreachStatus = "new" | "contacted" | "replied" | "in_work" | "declined";
+export type OutreachStatus = "new" | "contacted" | "replied" | "in_work" | "posted" | "declined";
 
 /** Знімки цифр автора при кожному зборі: з часом видно стрибки підписників. */
 export const creatorSnapshots = pgTable(
@@ -323,6 +323,8 @@ export const searches = pgTable(
     /** Повторювати кожні N днів, показуючи лише нових авторів. */
     repeatDays: integer("repeat_days"),
     parentId: integer("parent_id"),
+    /** Клієнт (бренд), для якого шукаємо: його правила переговорів і звіт. */
+    clientId: integer("client_id").references(() => clients.id, { onDelete: "set null" }),
     status: text("status").$type<"queued" | "running" | "done" | "failed" | "cancelled">().notNull().default("queued"),
     progress: jsonb("progress").$type<SearchProgress>(),
     stats: jsonb("stats").$type<SearchStats>().notNull().default({}),
@@ -454,3 +456,163 @@ export const scrapeResults = pgTable(
 ).enableRLS();
 
 export type ScrapeJob = typeof scrapeJobs.$inferSelect;
+
+/** Відповідь, яку дала людина на питання, якого не було в правилах: далі ІІ відповідає сам. */
+export type FaqEntry = { q: string; a: string; addedAt: string };
+
+/**
+ * Правила переговорів клієнта. ІІ відповідає й торгується лише в цих межах: ставку понад стелю,
+ * нові умови й питання, на які тут немає відповіді, він передає людині.
+ */
+export type ClientPolicy = {
+  brandName: string;
+  website: string;
+  /** Що пропонуємо: товар, послуга. */
+  product: string;
+  offerType: "barter" | "paid" | "both";
+  productValueUsd: number | null;
+  /** Перша пропозиція й жорстка стеля оплати, $. */
+  feeTargetUsd: number | null;
+  feeMaxUsd: number | null;
+  /** Скільки разів можна торгуватися, перш ніж покликати людину. */
+  maxRounds: number;
+  /** Що робити, якщо автор просить більше за стелю. */
+  aboveMax: "escalate" | "decline";
+  deliverables: string;
+  /** Скільки днів на публікацію після отримання товару. */
+  deadlineDays: number;
+  usageRights: string;
+  disclosure: string;
+  /** Що автор має відмітити в дописі: @бренд, #хештег — за цим перевіряється публікація. */
+  mustTag: string[];
+  /** Куди можемо відправити товар (коди країн); порожньо — куди завгодно. */
+  shipsTo: string[];
+  /** Інші правила словами (довірений текст від вас). */
+  notes: string;
+  faq: FaqEntry[];
+  /** approve — кожен лист чекає вашого «Надіслати»; auto — перевірені листи йдуть самі. */
+  mode: "approve" | "auto";
+  /** Через скільки днів без відповіді нагадати (двічі), далі — «без відповіді». */
+  followupDays: number;
+  senderName: string;
+};
+
+export const clients = pgTable("clients", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
+  policy: jsonb("policy").$type<ClientPolicy>().notNull(),
+  mailboxId: integer("mailbox_id").references(() => mailboxes.id, { onDelete: "set null" }),
+  createdAt: ts("created_at").notNull().defaultNow(),
+}).enableRLS();
+
+/** Поштова скринька для листування: SMTP — надсилання, IMAP — відповіді. Пароль зашифровано MASTER_KEY. */
+export const mailboxes = pgTable("mailboxes", {
+  id: serial("id").primaryKey(),
+  email: text("email").notNull().unique(),
+  fromName: text("from_name"),
+  smtpHost: text("smtp_host").notNull(),
+  smtpPort: integer("smtp_port").notNull().default(465),
+  imapHost: text("imap_host").notNull(),
+  imapPort: integer("imap_port").notNull().default(993),
+  username: text("username").notNull(),
+  passwordEnc: text("password_enc").notNull(),
+  /** Не більше стількох листів на добу: нова скринька, що шле сотні листів, швидко потрапляє в спам. */
+  dailyLimit: integer("daily_limit").notNull().default(30),
+  /** Останній прочитаний UID у теці «Вхідні» — щоб не обробляти листи двічі. */
+  lastUid: integer("last_uid"),
+  uidValidity: text("uid_validity"),
+  lastPolledAt: ts("last_polled_at"),
+  lastError: text("last_error"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+}).enableRLS();
+
+export type ThreadStatus =
+  | "draft" | "sent" | "negotiating" | "agreed" | "to_ship" | "shipped" | "posted" | "declined" | "no_reply" | "closed";
+
+/** Узгоджені умови: що й за скільки автор робить. */
+export type ThreadTerms = { feeUsd: number | null; barter: boolean; deliverables: string; deadlineDays: number };
+export type PostCheck = { checkedAt: string; found: boolean; url?: string; disclosure?: boolean; tags?: string[]; note?: string };
+
+/** Листування з автором від імені клієнта: один ланцюжок на пару «автор — клієнт». */
+export const outreachThreads = pgTable(
+  "outreach_threads",
+  {
+    id: serial("id").primaryKey(),
+    creatorId: integer("creator_id").notNull().references(() => creators.id, { onDelete: "cascade" }),
+    clientId: integer("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+    searchId: integer("search_id").references(() => searches.id, { onDelete: "set null" }),
+    /** Скринька, з якої ведеться листування: відповіді йдуть з тієї самої адреси. */
+    mailboxId: integer("mailbox_id").references(() => mailboxes.id, { onDelete: "set null" }),
+    toEmail: text("to_email").notNull(),
+    subject: text("subject").notNull(),
+    language: text("language").notNull().default("en"),
+    status: text("status").$type<ThreadStatus>().notNull().default("draft"),
+    /** Чому потрібна людина (питання поза правилами, ставка понад стелю тощо); null — ІІ веде сам. */
+    needsHuman: text("needs_human"),
+    /** Питання автора, на які в правилах немає відповіді. */
+    openQuestions: jsonb("open_questions").$type<string[]>().notNull().default([]),
+    rounds: integer("rounds").notNull().default(0),
+    /** Остання ставка, яку назвав автор, і остання наша пропозиція, $. */
+    askedFeeUsd: doublePrecision("asked_fee_usd"),
+    offeredFeeUsd: doublePrecision("offered_fee_usd"),
+    terms: jsonb("terms").$type<ThreadTerms>(),
+    /** Адреса доставки — особисті дані: видаляється разом з автором. */
+    shipping: text("shipping"),
+    followups: integer("followups").notNull().default(0),
+    /** Коли наступна автоматична дія: нагадування чи перевірка допису. */
+    nextActionAt: ts("next_action_at"),
+    agreedAt: ts("agreed_at"),
+    shippedAt: ts("shipped_at"),
+    postDueAt: ts("post_due_at"),
+    postUrl: text("post_url"),
+    postedAt: ts("posted_at"),
+    postCheck: jsonb("post_check").$type<PostCheck>(),
+    lastInboundAt: ts("last_inbound_at"),
+    lastOutboundAt: ts("last_outbound_at"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("outreach_threads_pair_idx").on(t.creatorId, t.clientId),
+    index("outreach_threads_status_idx").on(t.status, t.nextActionAt),
+  ],
+).enableRLS();
+
+export type MessageKind = "first" | "reply" | "followup" | "manual" | "inbound";
+export type MessageStatus = "draft" | "queued" | "sent" | "failed" | "received" | "discarded";
+
+export const outreachMessages = pgTable(
+  "outreach_messages",
+  {
+    id: serial("id").primaryKey(),
+    threadId: integer("thread_id").notNull().references(() => outreachThreads.id, { onDelete: "cascade" }),
+    mailboxId: integer("mailbox_id").references(() => mailboxes.id, { onDelete: "set null" }),
+    direction: text("direction").$type<"in" | "out">().notNull(),
+    kind: text("kind").$type<MessageKind>().notNull(),
+    status: text("status").$type<MessageStatus>().notNull(),
+    subject: text("subject").notNull(),
+    body: text("body").notNull(),
+    /** Message-ID листа: за ним відповіді знаходять свій ланцюжок. */
+    messageId: text("message_id"),
+    inReplyTo: text("in_reply_to"),
+    fromEmail: text("from_email"),
+    toEmail: text("to_email"),
+    /** Розбір вхідного листа моделлю або рішення й перевірка для вихідного. */
+    ai: jsonb("ai").$type<Record<string, unknown>>(),
+    issues: jsonb("issues").$type<string[]>().notNull().default([]),
+    error: text("error"),
+    sentAt: ts("sent_at"),
+    receivedAt: ts("received_at"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [
+    index("outreach_messages_thread_idx").on(t.threadId, t.createdAt),
+    index("outreach_messages_status_idx").on(t.status, t.mailboxId),
+    uniqueIndex("outreach_messages_mid_idx").on(t.messageId),
+  ],
+).enableRLS();
+
+export type Client = typeof clients.$inferSelect;
+export type Mailbox = typeof mailboxes.$inferSelect;
+export type OutreachThread = typeof outreachThreads.$inferSelect;
+export type OutreachMessage = typeof outreachMessages.$inferSelect;

@@ -57,6 +57,13 @@
       "when": 1794470360345,
       "tag": "0007_cuddly_champions",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794518825909,
+      "tag": "0008_careful_masque",
+      "breakpoints": true
     }
   ]
 }

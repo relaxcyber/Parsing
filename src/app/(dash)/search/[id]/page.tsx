@@ -1,9 +1,11 @@
 import Link from "next/link";
+import { STATUS_LABELS } from "../../creators/labels";
+import { startForSearch } from "../../inbox/actions";
 import { notFound } from "next/navigation";
 import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { auditView } from "@/audit/vision";
 import { getDb } from "@/db/client";
-import { creatorContacts, creators, searchCandidates, searches } from "@/db/schema";
+import { clients, creatorContacts, creators, searchCandidates, searches } from "@/db/schema";
 import { activityStatus } from "@/enrich/activity";
 import { classifyLinks } from "@/enrich/links";
 import { calibrate } from "@/search/calibrate";
@@ -40,17 +42,26 @@ const ACTIVITY = {
   unknown: { label: "невідомо", color: "var(--ink-3)" },
 } as const;
 const EMAIL_NOTE: Record<string, string> = { personal: "особиста", business: "власний домен", role: "загальна адреса", unknown: "не перевірено" };
+/**
+ * Обрізає текст за символами, а не за кодовими одиницями: інакше емодзі розрізається навпіл,
+ * браузер замінює половинку на «�», і React бачить розбіжність між сервером і клієнтом.
+ */
+const clip = (s: string, n: number) => {
+  const chars = Array.from(s.replace(/\r\n?/g, "\n"));
+  return chars.length > n ? `${chars.slice(0, n).join("")}…` : chars.join("");
+};
 const RISK: Record<string, string> = { low: "низький", medium: "середній", high: "високий", unknown: "невідомо" };
 
 export default async function SearchDetail({ params, searchParams }: {
-  params: Promise<{ id: string }>; searchParams: Promise<{ view?: string }>;
+  params: Promise<{ id: string }>; searchParams: Promise<{ view?: string; msg?: string }>;
 }) {
   const searchId = Number((await params).id);
   if (!Number.isInteger(searchId)) notFound();
   const db = getDb();
   const [s] = await db.select().from(searches).where(eq(searches.id, searchId));
   if (!s) notFound();
-  const viewParam = (await searchParams).view;
+  const { view: viewParam, msg } = await searchParams;
+  const [client] = s.clientId ? await db.select({ id: clients.id, name: clients.name }).from(clients).where(eq(clients.id, s.clientId)) : [];
   const view: View = viewParam && viewParam in VIEWS ? (viewParam as View) : "qualified";
   const crit = criteriaOf(s);
   const weights = weightsOf(s);
@@ -105,7 +116,8 @@ export default async function SearchDetail({ params, searchParams }: {
         {" "}· листи: {LANGS[s.outreachLanguage] ?? s.outreachLanguage} · витрати Apify до {usd(estimateCostUsd(s))}
         {s.targetLeads ? ` · мета: ${s.targetLeads} лідів` : ""}{s.budgetUsd ? ` · бюджет ${usd(s.budgetUsd)}` : ""}
       </p>
-      <p className="muted" style={{ marginTop: -12 }}>Критерії: {critLine.join(" · ")}</p>
+      <p className="muted" style={{ marginTop: -12 }}>Критерії: {critLine.join(" · ")}{client ? <> · клієнт: <Link href={`/clients/${client.id}`}>{client.name}</Link></> : null}</p>
+      {msg && <div className="flash" role="status">{msg}</div>}
 
       <section className="card">
         <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
@@ -122,6 +134,9 @@ export default async function SearchDetail({ params, searchParams }: {
                 <form action={rerunSearch}><input type="hidden" name="id" value={s.id} /><button>Запустити знову</button></form>
                 {countOf("qualified") > 0 && <Link href={`/search/${s.id}/report`}><button type="button">Звіт для клієнта</button></Link>}
                 {countOf("qualified") > 0 && <a href={`/search/${s.id}/export`}><button type="button">CSV: усі, хто підходить</button></a>}
+                {client && (st.leads ?? 0) > 0 && (
+                  <form action={startForSearch}><input type="hidden" name="searchId" value={s.id} /><button className="primary">Почати листування з лідами ({st.leads})</button></form>
+                )}
                 {(st.withEmail ?? 0) > 0 && <a href={`/search/${s.id}/export?only=email`}><button type="button">CSV для розсилки</button></a>}
                 <form action={deleteSearch}>
                   <input type="hidden" name="id" value={s.id} />
@@ -218,13 +233,13 @@ export default async function SearchDetail({ params, searchParams }: {
                         <Link href={`/creators/${c.id}?search=${s.id}`}><b>@{c.username}</b></Link>
                         {" "}<a href={`https://www.instagram.com/${c.username}/`} target="_blank" rel="noreferrer" className="muted" aria-label={`Instagram @${c.username}`}>↗</a>
                         {cand.lead && <div><span className="badge">готовий лід</span></div>}
-                        {c.outreachStatus !== "new" && <div><span className="badge">{c.outreachStatus === "contacted" ? "написали" : c.outreachStatus === "replied" ? "відповів" : c.outreachStatus === "in_work" ? "у роботі" : "відмова"}</span></div>}
+                        {c.outreachStatus !== "new" && <div><span className="badge">{STATUS_LABELS[c.outreachStatus]}</span></div>}
                         <div className="muted">{[c.displayName, c.followers != null ? `${nf.format(c.followers)} підписників` : null].filter(Boolean).join(" · ")}</div>
                         {(c.country || c.language) && (
                           <div className="muted">{[c.country ? `країна: ${c.country}${(c.countryConfidence ?? 0) < 0.6 ? "?" : ""}` : null, c.language ? `мова: ${c.language}` : null].filter(Boolean).join(" · ")}</div>
                         )}
                         {cand.source && <div className="muted">джерело: {cand.source}</div>}
-                        {c.bio && <div className="muted" style={{ maxWidth: 240, overflowWrap: "anywhere" }}>{c.bio.length > 110 ? `${c.bio.slice(0, 110)}…` : c.bio}</div>}
+                        {c.bio && <div className="muted" style={{ maxWidth: 240, overflowWrap: "anywhere" }}>{clip(c.bio, 110)}</div>}
                       </td>
                       <td className="num"><b>{idx(cand.score)}</b></td>
                       <td className="num">{idx(cand.fit)}</td>

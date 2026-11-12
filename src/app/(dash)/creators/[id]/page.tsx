@@ -9,12 +9,13 @@ import type { TrustReport } from "@/analysis/trust";
 import type { DeepAudit } from "@/audit/deep";
 import { auditView } from "@/audit/vision";
 import { getDb } from "@/db/client";
-import { creatorContacts, creators, outreachDrafts, searchCandidates, searches } from "@/db/schema";
+import { clients, creatorContacts, creators, outreachDrafts, outreachThreads, searchCandidates, searches } from "@/db/schema";
 import { activityStatus } from "@/enrich/activity";
 import { FORMAT_LABELS } from "@/search/criteria";
 import { createDraft, setOutreachStatus, setVerdict, suppress } from "../../search/actions";
 import { ConfirmButton } from "../../keys/confirm-button";
-import { STATUS_LABELS } from "../labels";
+import { startThreadAction } from "../../inbox/actions";
+import { STATUS_LABELS, THREAD_LABELS } from "../labels";
 import { CopyButton, PrintButton } from "../print-button";
 
 const nf = new Intl.NumberFormat("uk-UA", { maximumFractionDigits: 1 });
@@ -44,11 +45,14 @@ export default async function CreatorCard({ params, searchParams }: {
   const db = getDb();
   const [c] = await db.select().from(creators).where(eq(creators.id, id));
   if (!c) notFound();
-  const [contacts, drafts, appearances] = await Promise.all([
+  const [contacts, drafts, appearances, threads, clientRows] = await Promise.all([
     db.select().from(creatorContacts).where(eq(creatorContacts.creatorId, id)),
     db.select().from(outreachDrafts).where(eq(outreachDrafts.creatorId, id)).orderBy(desc(outreachDrafts.createdAt)).limit(5),
     db.select({ cand: searchCandidates, name: searches.name }).from(searchCandidates).innerJoin(searches, eq(searchCandidates.searchId, searches.id))
       .where(eq(searchCandidates.creatorId, id)).orderBy(desc(searchCandidates.createdAt)).limit(20),
+    db.select({ t: outreachThreads, client: clients.name }).from(outreachThreads).innerJoin(clients, eq(clients.id, outreachThreads.clientId))
+      .where(eq(outreachThreads.creatorId, id)).orderBy(desc(outreachThreads.updatedAt)),
+    db.select({ id: clients.id, name: clients.name, mailboxId: clients.mailboxId }).from(clients).orderBy(clients.name),
   ]);
   const searchId = Number(search) || appearances[0]?.cand.searchId || null;
   const m = c.metrics as PostMetrics | null;
@@ -249,6 +253,28 @@ export default async function CreatorCard({ params, searchParams }: {
             {c.portfolio.map((l) => <li key={l}>портфоліо: <a href={l} target="_blank" rel="noreferrer">{l}</a></li>)}
             {c.links.map((l) => <li key={l}><a href={l} target="_blank" rel="noreferrer">{l}</a></li>)}
           </ul>
+        )}
+      </section>
+
+      <section className="card no-print" id="outreach">
+        <h2>Листування від імені клієнта</h2>
+        {threads.length > 0 && (
+          <ul className="plain">
+            {threads.map(({ t, client }) => (
+              <li key={t.id}><Link href={`/inbox/${t.id}`}>{client}</Link> — {THREAD_LABELS[t.status]}{t.needsHuman ? <span className="risk-high"> · потрібна людина</span> : ""}</li>
+            ))}
+          </ul>
+        )}
+        {clientRows.length === 0 ? <p className="muted"><Link href="/clients">Додайте клієнта</Link> з правилами переговорів — і ІІ листуватиметься з автором від його імені.</p> : (
+          <form action={startThreadAction} className="actions" style={{ alignItems: "end", marginTop: 8 }}>
+            <input type="hidden" name="creatorId" value={c.id} />
+            {searchId && <input type="hidden" name="searchId" value={searchId} />}
+            <label>Клієнт<select name="clientId">{clientRows.map((x) => <option key={x.id} value={x.id}>{x.name}{x.mailboxId ? "" : " (без скриньки)"}</option>)}</select></label>
+            <label>Адреса
+              <select name="toEmail">{[...new Set([...contacts.map((k) => k.email), ...c.emails])].map((e) => <option key={e} value={e}>{e}</option>)}</select>
+            </label>
+            <button className="primary" disabled={contacts.length === 0 && c.emails.length === 0}>Почати листування</button>
+          </form>
         )}
       </section>
 

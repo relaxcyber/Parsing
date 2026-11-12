@@ -46,7 +46,7 @@ function Weight({ name, label, v }: { name: string; label: string; v: Values }) 
   );
 }
 
-export function SearchForm({ templates }: { templates: { name: string; data: Values }[] }) {
+export function SearchForm({ templates, clients = [] }: { templates: { name: string; data: Values }[]; clients?: { id: number; name: string }[] }) {
   const ref = useRef<HTMLFormElement>(null);
   const [values, setValues] = useState<Values>(DEFAULTS);
   const [formKey, setFormKey] = useState(0);
@@ -226,6 +226,13 @@ export function SearchForm({ templates }: { templates: { name: string; data: Val
               </select>
             </label>
             <label>Бренд (для листа)<input name="brandName" maxLength={80} placeholder="напр. Glow Lab" defaultValue={v.brandName} /></label>
+            <label>
+              Клієнт (листування й звіт)
+              <select name="clientId" defaultValue="">
+                <option value="">— без клієнта —</option>
+                {clients.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+              </select>
+            </label>
           </div>
           <label className="wide">Умови співпраці — модель не назве в листі інших цифр<textarea name="offer" rows={2} placeholder="напр. 3 відео до 30 с, $150 за відео, права на рекламу 3 місяці" defaultValue={v.offer} /></label>
           <label className="wide">Приклад листа, тон якого вам подобається (необов’язково)<textarea name="letterExample" rows={3} defaultValue={v.letterExample} /></label>
