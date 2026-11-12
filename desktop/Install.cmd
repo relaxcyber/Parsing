@@ -4,6 +4,7 @@ setlocal
 title Parsing - встановлення
 rem Встановлює Parsing на цей комп'ютер: завантажує проєкт, налаштовує базу, створює ярлик.
 rem Запускати подвійним клацанням. Повторний запуск оновлює проєкт.
+rem Вмикає автозапуск сервера під час входу у Windows (вимкнути: npm run shortcut -- --no-autostart).
 rem SUPABASE_REF - ідентифікатор проєкту Supabase (20 символів з адреси проєкту); можна лишити порожнім.
 set SUPABASE_REF=
 set BRANCH=ccr-2acbc8a5-l1bgjn
@@ -24,6 +25,10 @@ goto deps
 
 :update
 echo Оновлюю проєкт у %DIR% ...
+rem Працюючий сервер тримає файли залежностей, і npm install не зміг би їх замінити.
+if exist "%DIR%\scripts\launch.mjs" node "%DIR%\scripts\launch.mjs" --stop >nul 2>nul
+rem npm install інколи переписує package-lock.json, і тоді git pull відмовляється оновлювати.
+git -C "%DIR%" checkout -- package-lock.json >nul 2>nul
 git -C "%DIR%" pull --ff-only
 if errorlevel 1 goto failed
 
@@ -50,7 +55,8 @@ echo Запускаю дашборд, перший запуск триває д�
 call npm run launch
 if errorlevel 1 goto failed
 echo.
-echo Готово. Надалі відкривайте дашборд ярликом Parsing на робочому столі.
+echo Готово. Сервер тепер запускається сам після ввімкнення комп'ютера:
+echo дашборд відкривається за адресою http://127.0.0.1:3000 або ярликом Parsing.
 pause
 exit /b 0
 
