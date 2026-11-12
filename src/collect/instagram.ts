@@ -6,6 +6,10 @@ import { getJson, postJson } from "./http";
 
 const PROFILE_ACTOR = "apify~instagram-profile-scraper";
 const HASHTAG_ACTOR = "apify~instagram-hashtag-scraper";
+const COMMENT_ACTOR = "apify~instagram-comment-scraper";
+const SEARCH_ACTOR = "apify~instagram-search-scraper";
+const TAGGED_ACTOR = "apify~instagram-tagged-scraper";
+const SCRAPER_ACTOR = "apify~instagram-scraper";
 
 const n = (v: unknown) => (typeof v === "number" && v >= 0 ? v : undefined);
 const url = (v: unknown) => (typeof v === "string" && /^https?:\/\//.test(v) ? v : undefined);
@@ -110,7 +114,7 @@ async function retryRead<T>(read: () => Promise<T>, attempts: number): Promise<T
  * Опитування та читання набору даних ідуть тим самим ключем із власними повторами, а вартість
  * записується в облік за будь-якого завершення — успіх, помилка чи вичерпаний час.
  */
-async function runActor(db: Db, actor: string, input: unknown, purpose: string, opts: RunOptions): Promise<any[]> {
+async function runActor(db: Db, actor: string, input: unknown, purpose: string, opts: RunOptions): Promise<{ items: any[]; costUsd: number }> {
   // Стеля списання на рівні Apify: зайвого не зніме, навіть якщо актор поверне більше.
   const cap = Math.max(0.05, opts.maxItems * PRICE_GUESS_USD * 1.5).toFixed(2);
   const query = `maxItems=${opts.maxItems}&maxTotalChargeUsd=${cap}&timeout=${POLL_DEADLINE_MS / 1000 - 60}`;
@@ -146,13 +150,14 @@ async function runActor(db: Db, actor: string, input: unknown, purpose: string, 
       `${e instanceof Error ? e.message : e}. Запуск Apify ${started.id} міг бути оплачений — його результат зберігається в Apify 7 днів.`,
     );
   }
+  const costUsd = runCostUsd(run, items?.length ?? 0);
   await reportResult(db, key.id, {
-    ok: !failure, units: runCostUsd(run, items?.length ?? 0), httpStatus: failure ? undefined : 200, error: failure?.message, purpose,
+    ok: !failure, units: costUsd, httpStatus: failure ? undefined : 200, error: failure?.message, purpose,
   }).catch((e) => console.error("Не вдалося записати вартість запуску Apify:", e));
   // Звірка — уточнення фактичного залишку; свою помилку вона сама пише в lastError ключа.
   await syncKeyQuota(db, key.id).catch(() => {});
   if (failure) throw failure;
-  return items!;
+  return { items: items!, costUsd };
 }
 
 /** «@name», «#tag» або посилання на профіль → чисте ім’я. */
@@ -163,7 +168,7 @@ export const cleanHandle = (v: string) => {
 };
 
 export type Collected = { item: ContentItemInput; raw?: unknown };
-export type Batch = { collected: Collected[]; skipped: string[] };
+export type Batch = { collected: Collected[]; skipped: string[]; costUsd?: number };
 
 /** Перетворює відповідь актора; якщо жоден елемент не розпізнано — це зміна формату, а не «нічого не знайдено». */
 function mapBatch(raw: any[], map: (r: any) => ContentItemInput[], what: string): Batch {
@@ -195,11 +200,61 @@ type OnStart = Pick<RunOptions, "onStart">;
 
 export async function fetchInstagramProfiles(db: Db, usernames: string[], opts: OnStart = {}): Promise<Batch> {
   const names = usernames.map(cleanHandle);
-  const raw = await runActor(db, PROFILE_ACTOR, { usernames: names }, "instagram-profile", { maxItems: names.length, ...opts });
-  return mapBatch(raw, (r) => mapProfile(r), "профілі");
+  const { items, costUsd } = await runActor(db, PROFILE_ACTOR, { usernames: names }, "instagram-profile", { maxItems: names.length, ...opts });
+  return { ...mapBatch(items, (r) => mapProfile(r), "профілі"), costUsd };
 }
 
+const postsOnly = (r: any) => [mapPost(r)].filter((p): p is ContentItemInput => p != null);
+
 export async function fetchInstagramHashtag(db: Db, tag: string, limit: number, opts: OnStart = {}): Promise<Batch> {
-  const raw = await runActor(db, HASHTAG_ACTOR, { hashtags: [cleanHandle(tag)], resultsLimit: limit }, "instagram-hashtag", { maxItems: limit, ...opts });
-  return mapBatch(raw, (r) => [mapPost(r)].filter((p): p is ContentItemInput => p != null), "дописи");
+  const { items, costUsd } = await runActor(db, HASHTAG_ACTOR, { hashtags: [cleanHandle(tag)], resultsLimit: limit }, "instagram-hashtag", { maxItems: limit, ...opts });
+  return { ...mapBatch(items, postsOnly, "дописи"), costUsd };
+}
+
+/** Коментар як елемент контракту: прив’язаний до допису через thread.rootId (shortcode). */
+export function mapComment(raw: any, now = new Date()): ContentItemInput | null {
+  const text = typeof raw?.text === "string" ? raw.text.trim() : "";
+  const postUrl = url(raw?.postUrl) ?? url(raw?.inputUrl);
+  const id = raw?.id ? String(raw.id) : null;
+  if (!text || !postUrl || !id) return null;
+  const shortCode = postUrl.match(/\/(?:p|reel|tv)\/([A-Za-z0-9_-]+)/)?.[1];
+  const username: string | undefined = raw.ownerUsername ?? raw.owner?.username;
+  return {
+    id: `comment:${id}`, source: "instagram", kind: "comment", url: url(raw.commentUrl) ?? postUrl,
+    author: username ? { username, url: profileUrl(username) } : null,
+    text: text.slice(0, 2000),
+    metrics: { likes: n(raw.likesCount) },
+    thread: { rootId: shortCode, parentId: shortCode, depth: 1 },
+    publishedAt: raw.timestamp && !Number.isNaN(Date.parse(raw.timestamp)) ? new Date(raw.timestamp) : undefined,
+    fetchedAt: now, via: "apify",
+  };
+}
+
+/** Коментарі під кількома дописами одним запуском. Платно: ~$0.0026 за коментар. */
+export async function fetchInstagramComments(db: Db, postUrls: string[], perPost: number, opts: OnStart = {}): Promise<Batch> {
+  const { items, costUsd } = await runActor(db, COMMENT_ACTOR, { directUrls: postUrls, resultsLimit: perPost }, "instagram-comments", {
+    maxItems: postUrls.length * perPost, ...opts,
+  });
+  return { ...mapBatch(items, (r) => [mapComment(r)].filter((c): c is ContentItemInput => c != null), "коментарі"), costUsd };
+}
+
+/** Пошук профілів Instagram за словами (ім’я, біо). Повертає профілі — з біо й останніми дописами, якщо актор їх дав. */
+export async function fetchInstagramUserSearch(db: Db, query: string, limit: number, opts: OnStart = {}): Promise<Batch> {
+  const { items, costUsd } = await runActor(db, SEARCH_ACTOR, { search: query, searchType: "user", searchLimit: limit }, "instagram-search", { maxItems: limit, ...opts });
+  return { ...mapBatch(items, (r) => mapProfile(r), "профілі з пошуку"), costUsd };
+}
+
+/** Дописи, де відмічено бренд: автори, які вже знімають для нього (або для конкурента). */
+export async function fetchInstagramTagged(db: Db, brand: string, limit: number, opts: OnStart = {}): Promise<Batch> {
+  const { items, costUsd } = await runActor(db, TAGGED_ACTOR, { username: [cleanHandle(brand)], resultsLimit: limit }, "instagram-tagged", { maxItems: limit, ...opts });
+  return { ...mapBatch(items, postsOnly, "дописи з відмітками"), costUsd };
+}
+
+/** Дописи з місця (місто, район, заклад) — для локального бізнесу. */
+export async function fetchInstagramPlace(db: Db, query: string, limit: number, opts: OnStart = {}): Promise<Batch> {
+  const { items, costUsd } = await runActor(
+    db, SCRAPER_ACTOR, { search: query, searchType: "place", searchLimit: 1, resultsType: "posts", resultsLimit: limit }, "instagram-place",
+    { maxItems: limit, ...opts },
+  );
+  return { ...mapBatch(items, postsOnly, "дописи з місця"), costUsd };
 }

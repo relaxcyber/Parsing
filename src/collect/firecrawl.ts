@@ -34,3 +34,24 @@ export async function fetchFirecrawl(db: Db, url: string): Promise<ContentItemIn
     { purpose: "scrape", retryTransient: true },
   );
 }
+
+/** Пошук у вебі через Firecrawl: знаходить сторінки (у т.ч. профілі Instagram) за запитом. */
+export async function searchFirecrawl(db: Db, query: string, limit: number): Promise<ContentItemInput[]> {
+  return withKey(
+    db,
+    "firecrawl",
+    async (key, usage) => {
+      const res = await postJson("https://api.firecrawl.dev/v1/search", key.secret, { query, limit }, 60_000);
+      if (!res?.success || !Array.isArray(res.data)) throw new NotChargedError(`Firecrawl: ${res?.error ?? "порожня відповідь"}`);
+      usage.units = Number(res.creditsUsed) || Math.max(1, res.data.length);
+      const now = new Date();
+      return res.data
+        .filter((d: any) => httpUrl(d?.url))
+        .map((d: any): ContentItemInput => ({
+          id: d.url, source: "web", kind: "article", url: d.url, title: d.title || undefined, text: d.description || undefined,
+          fetchedAt: now, via: "firecrawl",
+        }));
+    },
+    { purpose: "web-search", retryTransient: true },
+  );
+}

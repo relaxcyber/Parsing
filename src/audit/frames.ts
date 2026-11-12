@@ -19,23 +19,28 @@ async function ffmpegPath(): Promise<string | null> {
 
 const run = (bin: string, args: string[]) =>
   new Promise<{ ok: boolean; stderr: string }>((resolve) => {
-    execFile(bin, args, { timeout: 60_000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }, (err, _out, stderr) => resolve({ ok: !err, stderr: String(stderr) }));
+    execFile(/*turbopackIgnore: true*/ bin, args, { timeout: 60_000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 }, (err, _out, stderr) => resolve({ ok: !err, stderr: String(stderr) }));
   });
 
+export type VideoParts = { frames: Buffer[]; audio: Buffer | null; duration: number };
+
 /**
- * Кадри з тіла ролика (а не обкладинка): обкладинку легко зробити гарною при слабкому відео.
- * Беремо кадри на 25%, 50% і 75% тривалості. Повертає [] при будь-якій невдачі.
+ * Одне завантаження ролика — і кадри, і звук.
+ * at — моменти кадрів як частки тривалості; від’ємне число — секунди від початку (−1 → 1-ша секунда, «зачіпка»).
+ * audioSec — скільки секунд звуку взяти для розшифровки (0 — не брати).
+ * Повертає порожній результат при будь-якій невдачі: аудит тоді йде за обкладинками.
  */
-export async function extractFrames(videoUrl: string, count = 3): Promise<Buffer[]> {
+export async function processVideo(videoUrl: string, opts: { at: number[]; audioSec?: number }): Promise<VideoParts> {
+  const empty: VideoParts = { frames: [], audio: null, duration: 0 };
   const ffmpeg = await ffmpegPath();
-  if (!ffmpeg) return [];
+  if (!ffmpeg) return empty;
   let dir: string | undefined;
   try {
     await assertPublicUrl(videoUrl);
     const res = await fetch(videoUrl, { signal: AbortSignal.timeout(60_000), headers: { "user-agent": "Mozilla/5.0" } });
-    if (!res.ok || Number(res.headers.get("content-length")) > MAX_VIDEO_BYTES) return [];
+    if (!res.ok || Number(res.headers.get("content-length")) > MAX_VIDEO_BYTES) return empty;
     const bytes = Buffer.from(await res.arrayBuffer());
-    if (bytes.length < 10_000 || bytes.length > MAX_VIDEO_BYTES) return [];
+    if (bytes.length < 10_000 || bytes.length > MAX_VIDEO_BYTES) return empty;
 
     dir = await mkdtemp(path.join(os.tmpdir(), "frames-"));
     const file = path.join(dir, "video.mp4");
@@ -44,21 +49,35 @@ export async function extractFrames(videoUrl: string, count = 3): Promise<Buffer
     const probe = await run(ffmpeg, ["-hide_banner", "-i", file]);
     const m = probe.stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
     const duration = m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
-    if (!(duration > 0.5)) return [];
+    if (!(duration > 0.5)) return empty;
 
     const frames: Buffer[] = [];
-    for (let i = 1; i <= count; i++) {
+    for (const [i, a] of opts.at.entries()) {
       const out = path.join(dir, `f${i}.jpg`);
-      const at = ((duration * i) / (count + 1)).toFixed(2);
+      const at = (a < 0 ? Math.min(-a, duration * 0.5) : duration * a).toFixed(2);
       const r = await run(ffmpeg, ["-hide_banner", "-loglevel", "error", "-ss", at, "-i", file, "-frames:v", "1", "-q:v", "3", "-y", out]);
       if (!r.ok) continue;
       const buf = await readFile(out).catch(() => null);
       if (buf && buf.length > 1000) frames.push(buf);
     }
-    return frames;
+
+    let audio: Buffer | null = null;
+    if (opts.audioSec && /Audio:/.test(probe.stderr)) {
+      const out = path.join(dir, "audio.mp3");
+      // Моно 16 кГц: для розпізнавання мовлення цього досить, а файл у рази менший.
+      const r = await run(ffmpeg, ["-hide_banner", "-loglevel", "error", "-i", file, "-t", String(opts.audioSec), "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k", "-y", out]);
+      if (r.ok) audio = await readFile(out).catch(() => null);
+      if (audio && audio.length < 2000) audio = null;
+    }
+    return { frames, audio, duration };
   } catch {
-    return [];
+    return empty;
   } finally {
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+/** Кадри з тіла ролика (а не обкладинка): обкладинку легко зробити гарною при слабкому відео. */
+export async function extractFrames(videoUrl: string, count = 3): Promise<Buffer[]> {
+  return (await processVideo(videoUrl, { at: Array.from({ length: count }, (_, i) => (i + 1) / (count + 1)) })).frames;
 }

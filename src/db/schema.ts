@@ -164,6 +164,36 @@ export const creators = pgTable(
     quality: doublePrecision("quality"),
     audit: jsonb("audit").$type<Record<string, unknown>>(),
     auditedAt: ts("audited_at"),
+    /** Версія промпту, яким зроблено аудит: щоб порівнювати версії на ваших вердиктах. */
+    auditVersion: text("audit_version"),
+    follows: integer("follows"),
+    businessCategory: text("business_category"),
+    /** Порахований кодом підсумок дописів: медіани, розкид, частота. */
+    metrics: jsonb("metrics").$type<Record<string, unknown>>(),
+    /** Довіра до аудиторії: рівень ризику накрутки з причинами. */
+    trust: jsonb("trust").$type<Record<string, unknown>>(),
+    trustRisk: text("trust_risk").$type<"low" | "medium" | "high" | "unknown">(),
+    /** Реклама: частка рекламних дописів, бренди, як реклама «заходить» аудиторії. */
+    ads: jsonb("ads").$type<Record<string, unknown>>(),
+    /** Аналіз тексту профілю мовною моделлю — лише висновки з перевіреними цитатами. */
+    analysis: jsonb("analysis").$type<Record<string, unknown>>(),
+    analyzedAt: ts("analyzed_at"),
+    /** Глибокий аудит: кадри з роликів, розшифровка мовлення, розбір рекламної подачі. */
+    deepAudit: jsonb("deep_audit").$type<Record<string, unknown>>(),
+    adQuality: doublePrecision("ad_quality"),
+    deepAuditedAt: ts("deep_audited_at"),
+    /** Реакція аудиторії: вибірка коментарів і її розбір. */
+    commentsReport: jsonb("comments_report").$type<Record<string, unknown>>(),
+    commentsAt: ts("comments_at"),
+    /** Чому автора варто переглянути вручну (оцінка біля порога, моделі розійшлися). */
+    reviewNote: text("review_note"),
+    /** Робота з автором: new → contacted → replied → in_work / declined. */
+    outreachStatus: text("outreach_status").$type<OutreachStatus>().notNull().default("new"),
+    outreachAt: ts("outreach_at"),
+    outreachNote: text("outreach_note"),
+    /** Пам’ять відмов: магазин, агенція, закритий профіль — повторно за профіль не платимо. */
+    hardReject: text("hard_reject"),
+    hardRejectAt: ts("hard_reject_at"),
     firstSeenAt: ts("first_seen_at").notNull().defaultNow(),
     updatedAt: ts("updated_at").notNull().defaultNow(),
   },
@@ -171,6 +201,22 @@ export const creators = pgTable(
 ).enableRLS();
 
 export type CreatorRate = { title: string; amount: number; currency: string; sourceUrl: string };
+export type OutreachStatus = "new" | "contacted" | "replied" | "in_work" | "declined";
+
+/** Знімки цифр автора при кожному зборі: з часом видно стрибки підписників. */
+export const creatorSnapshots = pgTable(
+  "creator_snapshots",
+  {
+    id: serial("id").primaryKey(),
+    creatorId: integer("creator_id").notNull().references(() => creators.id, { onDelete: "cascade" }),
+    at: ts("at").notNull().defaultNow(),
+    followers: integer("followers"),
+    follows: integer("follows"),
+    postsCount: integer("posts_count"),
+    erLikes: doublePrecision("er_likes"),
+  },
+  (t) => [index("creator_snapshots_creator_idx").on(t.creatorId, t.at)],
+).enableRLS();
 
 /** Контакти з походженням: звідки взято адресу й коли — потрібно для GDPR (ст. 14) і для довіри до бази. */
 export const creatorContacts = pgTable(
@@ -204,9 +250,34 @@ export const suppressions = pgTable(
 ).enableRLS();
 
 export type SearchProgress = { stage: string; done: number; total: number };
+export type SourceStats = { authors: number; qualified: number; leads: number; costUsd: number };
 export type SearchStats = {
   posts?: number; authors?: number; shortlisted?: number; profilesFetched?: number; profilesReused?: number; qualified?: number;
   linkPages?: number; withEmail?: number; audited?: number; leads?: number; note?: string;
+  analyzed?: number; deepAudited?: number; commentsAnalyzed?: number; review?: number; skippedKnown?: number;
+  costUsd?: number; waves?: number; expandedTags?: string[]; bySource?: Record<string, SourceStats>; notes?: string[];
+};
+
+export type CriterionMode = "required" | "preferred" | "off";
+export type ContentFormat = "talking_to_camera" | "product_demo" | "voiceover" | "subtitles";
+/** Гнучкі критерії: кожен — обов’язково (відсіює), бажано (піднімає в рейтингу) або не важливо. */
+export type SearchCriteria = {
+  followers: CriterionMode;
+  country: CriterionMode;
+  language: CriterionMode;
+  activity: { mode: CriterionMode; days: number };
+  er: { mode: CriterionMode; minPct: number };
+  email: CriterionMode;
+  ads: CriterionMode;
+  trust: { mode: CriterionMode; maxRisk: "low" | "medium" };
+  formats: { mode: CriterionMode; list: ContentFormat[] };
+  quality: { min: number; lead: number };
+};
+/** Вага кожного індексу в загальній оцінці (0 — не враховувати). */
+export type IndexWeights = { fit: number; quality: number; readiness: number; trust: number; match: number };
+/** Джерела кандидатів, крім хештегів. */
+export type SearchSources = {
+  bioQueries: string[]; competitors: string[]; seeds: string[]; places: string[]; usernames: string[]; webQueries: string[];
 };
 
 export const searches = pgTable(
@@ -231,6 +302,27 @@ export const searches = pgTable(
     focus: text("focus").$type<"ugc" | "affiliate">().notNull().default("ugc"),
     /** Скільком найкращим кандидатам робити візуальний аудит (він витрачає ліміти мовної моделі). */
     auditLimit: integer("audit_limit").notNull().default(30),
+    /** Бриф: що за бізнес, товар і який автор потрібен — його бачать модель-аналітик і автор листів. */
+    brief: text("brief"),
+    brandName: text("brand_name"),
+    /** Умови співпраці для листа (ставка, формат, строки). Модель не може вигадати інших. */
+    offer: text("offer"),
+    /** Приклад листа, тон якого вам подобається. */
+    letterExample: text("letter_example"),
+    sources: jsonb("sources").$type<Partial<SearchSources>>().notNull().default({}),
+    criteria: jsonb("criteria").$type<Partial<SearchCriteria>>().notNull().default({}),
+    weights: jsonb("weights").$type<Partial<IndexWeights>>().notNull().default({}),
+    /** Автопілот: зупинитися, коли знайдено стільки лідів або витрачено бюджет. */
+    targetLeads: integer("target_leads"),
+    budgetUsd: doublePrecision("budget_usd"),
+    /** Скільком найкращим глибокий аудит (кадри з роликів, мовлення) і платний розбір коментарів. */
+    deepLimit: integer("deep_limit").notNull().default(10),
+    commentsLimit: integer("comments_limit").notNull().default(0),
+    /** Не пропонувати авторів, яким уже писали. */
+    excludeContacted: boolean("exclude_contacted").notNull().default(true),
+    /** Повторювати кожні N днів, показуючи лише нових авторів. */
+    repeatDays: integer("repeat_days"),
+    parentId: integer("parent_id"),
     status: text("status").$type<"queued" | "running" | "done" | "failed" | "cancelled">().notNull().default("queued"),
     progress: jsonb("progress").$type<SearchProgress>(),
     stats: jsonb("stats").$type<SearchStats>().notNull().default({}),
@@ -258,6 +350,11 @@ export const searchCandidates = pgTable(
     /** «Готовий лід»: активний, є придатний email і якість візуалу не нижче порога. */
     lead: boolean("lead").notNull().default(false),
     postIds: jsonb("post_ids").$type<number[]>().notNull().default([]),
+    /** Звідки прийшов автор: «#тег», «біо: запит», «відмітки @бренд» тощо — для ціни ліда за джерелом. */
+    source: text("source"),
+    /** Індекси «Довіра» й «Відповідність критеріям бажано». */
+    trust: doublePrecision("trust"),
+    match: doublePrecision("match"),
     createdAt: ts("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -265,6 +362,53 @@ export const searchCandidates = pgTable(
     index("search_candidates_rank_idx").on(t.searchId, t.stage, t.score),
   ],
 ).enableRLS();
+
+/** Збережені налаштування пошуку під нішу чи клієнта. */
+export const searchTemplates = pgTable("search_templates", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  data: jsonb("data").$type<Record<string, string>>().notNull(),
+  createdAt: ts("created_at").notNull().defaultNow(),
+}).enableRLS();
+
+/** Кеш відповідей мовної моделі: той самий запит удруге не витрачає ліміт. */
+export const llmCache = pgTable("llm_cache", {
+  key: text("key").primaryKey(),
+  purpose: text("purpose").notNull(),
+  provider: text("provider").notNull(),
+  model: text("model").notNull(),
+  reply: text("reply").notNull(),
+  createdAt: ts("created_at").notNull().defaultNow(),
+}).enableRLS();
+
+/** Чернетки листів: тексти, лист фактів, з якого їх написано, і знайдені перевіркою проблеми. */
+export const outreachDrafts = pgTable(
+  "outreach_drafts",
+  {
+    id: serial("id").primaryKey(),
+    creatorId: integer("creator_id").notNull().references(() => creators.id, { onDelete: "cascade" }),
+    searchId: integer("search_id").references(() => searches.id, { onDelete: "set null" }),
+    language: text("language").notNull(),
+    /** «example» — у тоні вашого прикладу, «standard» — стандартний. Для частки відповідей за стилем. */
+    style: text("style").notNull(),
+    data: jsonb("data").$type<Record<string, string>>().notNull(),
+    facts: jsonb("facts").$type<Record<string, unknown>>().notNull(),
+    issues: jsonb("issues").$type<string[]>().notNull().default([]),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("outreach_drafts_creator_idx").on(t.creatorId, t.createdAt)],
+).enableRLS();
+
+/** Перевірка промпту на ваших вердиктах: збіг моделі з вами для кожної версії. */
+export const evalRuns = pgTable("eval_runs", {
+  id: serial("id").primaryKey(),
+  version: text("version").notNull(),
+  total: integer("total").notNull(),
+  agree: integer("agree").notNull(),
+  threshold: integer("threshold").notNull(),
+  results: jsonb("results").$type<{ creatorId: number; verdict: "yes" | "no"; quality: number | null }[]>().notNull(),
+  createdAt: ts("created_at").notNull().defaultNow(),
+}).enableRLS();
 
 export type Creator = typeof creators.$inferSelect;
 export type Search = typeof searches.$inferSelect;

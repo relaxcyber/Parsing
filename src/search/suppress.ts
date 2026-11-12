@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { and, eq, inArray } from "drizzle-orm";
-import { collagePath } from "@/audit/vision";
+import { collagePath, deepCollagePath } from "@/audit/vision";
 import type { Db } from "@/db/client";
 import { contentItems, creatorContacts, creators, suppressions } from "@/db/schema";
 
@@ -32,5 +32,6 @@ export async function suppressCreator(db: Db, creatorId: number, reason: string)
   await db.delete(contentItems).where(and(eq(contentItems.source, c.platform), eq(contentItems.externalId, `profile:${c.username}`)));
   await db.delete(creators).where(eq(creators.id, creatorId)); // кандидати й контакти видаляються каскадом
   await rm(collagePath(creatorId), { force: true }).catch(() => {});
+  await rm(deepCollagePath(creatorId), { force: true }).catch(() => {});
   return true;
 }

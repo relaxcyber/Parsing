@@ -3,7 +3,7 @@ import { rm } from "node:fs/promises";
 import sharp from "sharp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { collagePath, qualityIndex, VisionAuditSchema } from "@/audit/vision";
+import { collagePath, deepCollagePath, groundVision, qualityIndex, VisionReplySchema } from "@/audit/vision";
 import { contentItems, creatorContacts, creators, searchCandidates, searches, suppressions, usageEvents } from "@/db/schema";
 import { activityOf } from "@/enrich/activity";
 import { checkEmail } from "@/enrich/email";
@@ -137,17 +137,27 @@ describe("link pages", () => {
 });
 
 describe("vision audit helpers", () => {
-  const audit = VisionAuditSchema.parse({
-    production_tier: "FLAGSHIP_SMARTPHONE", production_confidence: 0.8, lighting_quality: 8, background_cleanliness: 7,
-    direct_response_signals: { has_captions_subtitles: true, clear_product_focus: true, engaging_expression: false },
+  const reply = VisionReplySchema.parse({
+    frames: [{ n: 1, face_visible: true, product_visible: true, text_on_screen: false }, { n: 2, face_visible: true, product_visible: false, text_on_screen: false }],
+    sharpness: { score: 4, frames: [1, 2], note: "crisp" }, lighting: { score: 4, frames: [1] },
+    framing: { score: 3, frames: [] }, background: { score: 5, frames: [9] },
   });
-  it("derives the quality index and defaults optional fields", () => {
-    expect(qualityIndex(audit)).toBe(76); // 80·0.4 + 80·0.25 + 70·0.25 + 66.7·0.1
-    expect(audit).toMatchObject({ minor_is_main_subject: false, brand_safety_flags: [], rejection_reasons: [] });
-    expect(qualityIndex({ ...audit, production_tier: "LOWEND_DEGRADED", lighting_quality: 3, background_cleanliness: 3 })).toBe(32);
+  it("keeps only scores backed by real frame numbers and computes quality in code", () => {
+    const a = groundVision(reply, 2, { model: "m", fromVideo: 0 });
+    expect(a.scores.framing.score).toBeNull(); // без кадрів — не враховується
+    expect(a.scores.background.score).toBeNull(); // кадру 9 не було
+    expect(a.dropped).toBe(2);
+    expect([a.faceShare, a.productShare, a.textShare]).toEqual([1, 0.5, 0]);
+    expect(qualityIndex(a)).toBe(72); // (75·0.3 + 75·0.3)/0.6 = 75 → 75·0.9 + 50·0.1 ≈ 72.5
+    expect(qualityIndex({ ...a, scores: { ...a.scores, lighting: { score: null, frames: [], note: "" } } })).toBeNull();
+  });
+  it("needs frames on at least half of the collage to call children the main subject", () => {
+    const minor = (frames: number[]) => groundVision(VisionReplySchema.parse({ minor_is_main_subject: { value: true, frames } }), 4, { model: "m", fromVideo: 0 }).minor;
+    expect([minor([1]), minor([1, 3]), minor([])]).toEqual([false, true, false]);
   });
   it("pulls JSON out of a chatty model reply", () => {
     expect(parseJsonReply('Sure!\n```json\n{"a": 1}\n```')).toEqual({ a: 1 });
+    expect(parseJsonReply('<think>{"draft": true}</think>{"b": 2}')).toEqual({ b: 2 });
     expect(() => parseJsonReply("no json here")).toThrow();
   });
 });
@@ -163,9 +173,16 @@ const NOW = Date.now();
 const daysAgo = (n: number) => new Date(NOW - n * 86_400_000).toISOString();
 
 /** Підробка зовнішнього світу: Apify (хештеги й профілі), сторінки-візитки, картинки та мовна модель. */
-async function world(posts: any[], profiles: Record<string, any>, opts: { pages?: Record<string, string>; llm?: unknown } = {}) {
+type Task = "vision" | "profile" | "deep" | "comments" | "draft" | "other";
+const taskOf = (body: any): Task => {
+  const system = String(body?.messages?.find((m: any) => m.role === "system")?.content ?? "");
+  return /art director/.test(system) ? "vision" : /creator-sourcing team/.test(system) ? "profile" : /video work/.test(system) ? "deep"
+    : /Instagram comments/.test(system) ? "comments" : /outreach/i.test(system) ? "draft" : "other";
+};
+
+async function world(posts: any[], profiles: Record<string, any>, opts: { pages?: Record<string, string>; llm?: Partial<Record<Task, unknown>> } = {}) {
   const runs = new Map<string, any[]>();
-  const calls = { hashtag: 0, profile: 0, profileInputs: [] as string[][], pages: [] as string[], llm: 0 };
+  const calls = { hashtag: 0, profile: 0, profileInputs: [] as string[][], pages: [] as string[], llm: 0, tasks: [] as Task[] };
   const jpeg = await sharp({ create: { width: 320, height: 320, channels: 3, background: "#c08", noise: { type: "gaussian", mean: 128, sigma: 40 } } }).jpeg().toBuffer();
   const mock = vi.fn(async (url: string, init?: any) => {
     if (url.includes("/users/me/limits")) return Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0.1 } } });
@@ -188,8 +205,10 @@ async function world(posts: any[], profiles: Record<string, any>, opts: { pages?
     if (ds) return Response.json(runs.get(ds));
     if (url.includes("/chat/completions")) {
       calls.llm++;
+      const task = taskOf(JSON.parse(init.body));
+      calls.tasks.push(task);
       if (!opts.llm) return new Response("rate limited", { status: 429, headers: { "retry-after": "3600" } });
-      return Response.json({ choices: [{ message: { content: JSON.stringify(opts.llm) } }] });
+      return Response.json({ choices: [{ message: { content: JSON.stringify(opts.llm[task] ?? {}) } }] });
     }
     if (url.startsWith("https://cdn.example/")) return new Response(new Uint8Array(jpeg), { headers: { "content-type": "image/jpeg" } });
     if (opts.pages?.[url]) {
@@ -233,11 +252,19 @@ describe("search pipeline", () => {
       <a href="https://anna.my.canva.site/portfolio">Portfolio</a><a href="https://www.amazon.com/shop/anna">Amazon</a>
       <div>UGC video package <b>$180</b></div></body></html>`,
   };
+  const frames = [1, 2, 3, 4].map((n) => ({ n, face_visible: true, product_visible: true, text_on_screen: false, setting: "home" }));
   const goodAudit = {
-    production_tier: "FLAGSHIP_SMARTPHONE", production_confidence: 0.8, lighting_quality: 8, background_cleanliness: 8,
-    direct_response_signals: { has_captions_subtitles: true, clear_product_focus: true, engaging_expression: true },
-    minor_is_main_subject: false, brand_safety_flags: [], rejection_reasons: [], aesthetic: "Clean Girl", summary: "Soft light, tidy vanity.",
+    frames, sharpness: { score: 5, frames: [1, 2] }, lighting: { score: 5, frames: [1] }, framing: { score: 4, frames: [2] }, background: { score: 5, frames: [3] },
+    minor_is_main_subject: { value: false, frames: [] }, brand_safety_flags: [], aesthetic: "Clean Girl", summary: "Soft light, tidy vanity.",
   };
+  const profileReply = {
+    account_type: { value: "individual_creator", evidence: ["UGC creator"] }, ugc_creator: { value: "yes", evidence: ["UGC creator."] },
+    affiliate: { value: "unknown", evidence: [] }, open_to_collabs: { value: "yes", evidence: ["I invented this quote"] },
+    niches: [{ name: "skincare", evidence: ["Skincare unboxing"] }, { name: "fitness", evidence: ["gym every day"] }],
+    content_language: { value: "en", evidence: [] }, country: { value: "US", evidence: ["New York"] }, brief_fit: { score: null, reason: "", evidence: [] },
+    summary: "UGC creator focused on skincare.",
+  };
+  const llm = { vision: goodAudit, profile: profileReply, deep: {} };
   const newSearch = (db: any, extra = {}) =>
     db.insert(searches).values({
       name: "Тест", hashtags: ["ugccreator"], keywords: ["skincare", "makeup"], stopWords: ["giveaway"],
@@ -252,7 +279,7 @@ describe("search pipeline", () => {
     const db = await testDb();
     await addTestKey(db, "apify", "ap");
     await addTestKey(db, "groq", "gq");
-    const { mock, calls } = await world(posts, profiles, { pages, llm: goodAudit });
+    const { mock, calls } = await world(posts, profiles, { pages, llm });
     vi.stubGlobal("fetch", mock);
     const [s] = await newSearch(db);
     expect(await runNextSearch(db)).toBe(true);
@@ -260,18 +287,26 @@ describe("search pipeline", () => {
 
     const [done] = await db.select().from(searches).where(eq(searches.id, s.id));
     expect(done.error).toBeNull();
-    expect(done.stats).toEqual({
+    expect(done.stats).toMatchObject({
       posts: 8, authors: 7, shortlisted: 5, profilesReused: 0, profilesFetched: 4, linkPages: 1, withEmail: 1, audited: 1, qualified: 1, leads: 1,
+      analyzed: 1, waves: 1,
     });
+    // вартість: хештег і пачка профілів (підробка Apify щоразу повертає $0.01), усе — на рахунку джерела
+    expect(done.stats.costUsd).toBe(0.02);
+    expect(done.stats.bySource?.["#ugccreator"]).toEqual({ authors: 7, qualified: 1, leads: 1, costUsd: 0.02 });
     // магазин і стоп-слово відсіяні безкоштовно — за їхні профілі не платимо
     expect(calls.profileInputs).toEqual([["anna", "ben", "carl", "eve", "gina"]]);
-    // сторінку-візитку відкрито лише в автора, що пройшов жорсткі фільтри; аудит — одним запитом
-    expect([calls.pages, calls.llm]).toEqual([["https://beacons.ai/anna"], 1]);
+    // сторінку-візитку відкрито лише в автора, що пройшов жорсткі фільтри; модель — лише для нього
+    expect(calls.pages).toEqual(["https://beacons.ai/anna"]);
+    expect(calls.tasks).toEqual(["profile", "vision", "deep"]);
 
     const by = await candidates(db);
     const anna = by.anna;
-    expect(anna.cand).toMatchObject({ stage: "qualified", lead: true, readiness: 100, quality: 82 });
-    expect(anna.cand.score).toBe(Math.round((anna.cand.fit + 100 + 82) / 3));
+    expect(anna.cand).toMatchObject({ stage: "qualified", lead: true, readiness: 100, quality: 93, source: "#ugccreator" });
+    // довіри немає (вподобання приховані), відповідність — email бажаний і є
+    expect(anna.cand.score).toBe(Math.round((anna.cand.fit + 100 + 93 + 100) / 4));
+    // висновки моделі без підтвердженої цитати відкинуто: «fitness» і вигадана цитата про співпрацю
+    expect(anna.c.analysis).toMatchObject({ niches: [{ name: "skincare" }], openToCollabs: { value: "unknown" }, country: null, dropped: 3 });
     expect(anna.c).toMatchObject({
       followers: 5200, emails: ["anna@gmail.com", "hello@annacreates.co"], affiliate: ["Amazon Storefront"],
       portfolio: ["https://anna.my.canva.site/portfolio"], medianViews: 800, isPrivate: false,
@@ -280,6 +315,7 @@ describe("search pipeline", () => {
     expect(anna.c.audit.aesthetic).toBe("Clean Girl");
     expect(existsSync(collagePath(anna.c.id))).toBe(true);
     await rm(collagePath(anna.c.id), { force: true });
+    await rm(deepCollagePath(anna.c.id), { force: true });
 
     const contacts = await db.select().from(creatorContacts).orderBy(creatorContacts.email);
     expect(contacts.map((k: any) => [k.email, k.status, k.source, k.sourceUrl])).toEqual([
@@ -306,7 +342,7 @@ describe("search pipeline", () => {
     const [done] = await db.select().from(searches).where(eq(searches.id, s.id));
     expect(done.status).toBe("done");
     expect(done.stats).toMatchObject({ qualified: 1, audited: 0, leads: 0 });
-    expect(done.stats.note).toMatch(/Візуальний аудит зупинено/);
+    expect(done.stats.note).toMatch(/Мовна модель недоступна/);
     const by = await candidates(db);
     expect(by.anna.cand).toMatchObject({ stage: "qualified", quality: null, lead: false });
   });
@@ -315,15 +351,16 @@ describe("search pipeline", () => {
     const db = await testDb();
     await addTestKey(db, "apify", "ap");
     await addTestKey(db, "groq", "gq");
-    const bad = { ...goodAudit, production_tier: "LOWEND_DEGRADED", lighting_quality: 2, background_cleanliness: 2, minor_is_main_subject: true,
-      direct_response_signals: { has_captions_subtitles: false, clear_product_focus: false, engaging_expression: false } };
-    const { mock } = await world(posts, profiles, { pages, llm: bad });
+    const bad = { ...goodAudit, frames: frames.map((f) => ({ ...f, face_visible: false, product_visible: false })),
+      sharpness: { score: 1, frames: [1] }, lighting: { score: 1, frames: [2] }, framing: { score: 1, frames: [3] }, background: { score: 1, frames: [4] },
+      minor_is_main_subject: { value: true, frames: [1, 2, 3] } };
+    const { mock } = await world(posts, profiles, { pages, llm: { ...llm, vision: bad } });
     vi.stubGlobal("fetch", mock);
     await newSearch(db);
     await runNextSearch(db);
     const by = await candidates(db);
     expect(by.anna.cand.stage).toBe("rejected");
-    expect(by.anna.cand.reasons).toEqual(expect.arrayContaining(["головні герої контенту — діти", "низька якість зйомки (20)"]));
+    expect(by.anna.cand.reasons).toEqual(expect.arrayContaining(["головні герої контенту — діти", "низька якість зйомки (0)"]));
     await rm(collagePath(by.anna.c.id), { force: true });
   });
 
@@ -331,7 +368,7 @@ describe("search pipeline", () => {
     const db = await testDb();
     await addTestKey(db, "apify", "ap");
     await addTestKey(db, "groq", "gq");
-    const { mock, calls } = await world(posts, profiles, { pages, llm: goodAudit });
+    const { mock, calls } = await world(posts, profiles, { pages, llm });
     vi.stubGlobal("fetch", mock);
     const [s] = await newSearch(db);
     await runNextSearch(db);
@@ -341,21 +378,24 @@ describe("search pipeline", () => {
     await runNextSearch(db);
     const [again] = await db.select().from(searches).where(eq(searches.id, s.id));
     expect(again.status).toBe("done");
-    expect(again.stats).toMatchObject({ profilesReused: 5, profilesFetched: 0, linkPages: 0, audited: 0, qualified: 1, leads: 1 });
-    expect([calls.hashtag, calls.profile, calls.pages.length, calls.llm]).toEqual([1, 1, 1, 1]);
+    // закритий профіль і зниклий автор запам’ятані як відмови — їх профілі навіть із кешу не перевіряються
+    expect(again.stats).toMatchObject({ profilesReused: 3, skippedKnown: 2, profilesFetched: 0, linkPages: 0, audited: 0, qualified: 1, leads: 1 });
+    expect([calls.hashtag, calls.profile, calls.pages.length, calls.llm]).toEqual([1, 1, 1, 3]);
     expect((await db.select().from(usageEvents)).length).toBe(paid);
     const by = await candidates(db);
-    expect(by.anna.cand).toMatchObject({ lead: true, quality: 82 });
+    expect(by.anna.cand).toMatchObject({ lead: true, quality: 93 });
+    expect(by.eve.cand.reasons).toContain("раніше відхилено: закритий профіль");
     await rm(collagePath(by.anna.c.id), { force: true });
+    await rm(deepCollagePath(by.anna.c.id), { force: true });
   });
 
-  it("filters by country and language when known, lets unknown through, and flags suspicious engagement", async () => {
+  it("filters by country and language when known, lets unknown through, and rejects a high fake-audience risk", async () => {
     const db = await testDb();
     await addTestKey(db, "apify", "ap");
     const local = {
       ...profiles,
       anna: { ...profiles.anna, biography: "UGC creator 🇺🇸 anna@gmail.com", followersCount: 80000,
-        latestPosts: latest("anna", [2, 9]).map((p) => ({ ...p, likesCount: 40 })) },
+        latestPosts: latest("anna", [2, 9, 12, 13]).map((p) => ({ ...p, likesCount: 40 })) },
       ben: { ...profiles.ben, biography: "makeup ugc 🇮🇳", followersCount: 3000 },
       eve: { ...profiles.eve, private: false, biography: "skincare content creator", latestPosts: latest("eve", [3]) },
     };
@@ -364,8 +404,10 @@ describe("search pipeline", () => {
     await newSearch(db, { auditLimit: 0, countries: ["US", "GB"], languages: ["en"] });
     await runNextSearch(db);
     const by = await candidates(db);
-    expect([by.anna.c.country, by.anna.cand.stage]).toEqual(["US", "qualified"]);
-    expect(by.anna.cand.reasons.join()).toMatch(/залученість 0\.05% — можлива накрутка/);
+    // 80 тис. підписників і 40 вподобань: у 26 разів нижче за норму для розміру — високий ризик, критерій «обов’язково»
+    expect([by.anna.c.country, by.anna.cand.stage, by.anna.c.trustRisk]).toEqual(["US", "rejected", "high"]);
+    expect(by.anna.cand.reasons.join()).toMatch(/залученість 0\.05% — у 26 разів нижча за норму/);
+    expect(by.anna.cand.reasons).toContain("ризик накрутки: високий");
     expect([by.ben.c.country, by.ben.cand.reasons.at(-1)]).toEqual(["IN", "інша країна (IN)"]);
     expect([by.eve.c.country, by.eve.cand.stage]).toEqual([null, "qualified"]);
     expect(by.eve.cand.reasons).toContain("країну не визначено");
@@ -402,6 +444,9 @@ describe("search pipeline", () => {
     const [failed] = await db.select().from(searches).where(eq(searches.id, s.id));
     expect(failed.status).toBe("failed");
     expect(failed.error).toMatch(/apify/);
-    expect(estimateCostUsd({ hashtags: ["a", "b"], postsPerTag: 50, maxProfiles: 150 })).toBe(0.65);
+    const est = { ...s, hashtags: ["a", "b"], postsPerTag: 50, maxProfiles: 150, sources: {}, commentsLimit: 0, budgetUsd: null };
+    expect(estimateCostUsd(est)).toBe(0.65);
+    expect(estimateCostUsd({ ...est, commentsLimit: 10 })).toBe(1.43); // + 10 авторів × 3 дописи × 10 коментарів
+    expect(estimateCostUsd({ ...est, budgetUsd: 0.5 })).toBe(0.5);
   });
 });

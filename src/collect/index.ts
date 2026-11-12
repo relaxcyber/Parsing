@@ -4,8 +4,11 @@ import { ContentItemSchema, type ContentItem, type ContentItemInput } from "@/co
 import type { Db } from "@/db/client";
 import { collectRuns, contentItems } from "@/db/schema";
 import { NoKeyAvailableError } from "@/keys/router";
-import { fetchFirecrawl } from "./firecrawl";
-import { cleanHandle, fetchInstagramHashtag, fetchInstagramProfiles, type Batch, type Collected } from "./instagram";
+import { fetchFirecrawl, searchFirecrawl } from "./firecrawl";
+import {
+  cleanHandle, fetchInstagramComments, fetchInstagramHashtag, fetchInstagramPlace, fetchInstagramProfiles, fetchInstagramTagged,
+  fetchInstagramUserSearch, type Batch, type Collected,
+} from "./instagram";
 import { fetchLocal, LocalMiss } from "./local";
 import { assertPublicUrl, normalizeUrl } from "./net";
 import { fetchScrapling, ScraplingMissing } from "./scrapling";
@@ -13,9 +16,15 @@ import { fetchScrapling, ScraplingMissing } from "./scrapling";
 export type Target =
   | { type: "url"; url: string }
   | { type: "instagram-profile"; username: string }
-  | { type: "instagram-hashtag"; tag: string; limit?: number };
+  | { type: "instagram-hashtag"; tag: string; limit?: number }
+  | { type: "instagram-search"; query: string; limit?: number }
+  | { type: "instagram-tagged"; username: string; limit?: number }
+  | { type: "instagram-place"; query: string; limit?: number }
+  | { type: "instagram-comments"; postUrls: string[]; perPost?: number }
+  | { type: "web-search"; query: string; limit?: number };
 
-export type CollectResult = { items: ContentItem[]; ids: number[]; cached: boolean; cachedAt?: Date; notes: string[]; skipped: string[] };
+/** costUsd — скільки коштував цей збір (0, якщо взято з кешу). */
+export type CollectResult = { items: ContentItem[]; ids: number[]; cached: boolean; cachedAt?: Date; notes: string[]; skipped: string[]; costUsd: number };
 
 const HOUR = 3600_000;
 /** Після цього часу «запущений» збір вважаємо покинутим (сервер перезапускали тощо). */
@@ -35,9 +44,52 @@ function resolveTarget(target: Target): { target: Target; key: string; ttlMs: nu
     const username = cleanHandle(target.username).toLowerCase();
     return { target: { type: "instagram-profile", username }, key: `ig-profile:${username}`, ttlMs: 24 * HOUR };
   }
-  const tag = cleanHandle(target.tag).toLowerCase();
-  const limit = Math.min(Math.max(Math.round(target.limit ?? 20), 1), 200);
-  return { target: { type: "instagram-hashtag", tag, limit }, key: `ig-hashtag:${tag}:${limit}`, ttlMs: 6 * HOUR };
+  const lim = (v: number | undefined, def: number) => Math.min(Math.max(Math.round(v ?? def), 1), 200);
+  switch (target.type) {
+    case "instagram-hashtag": {
+      const tag = cleanHandle(target.tag).toLowerCase();
+      const limit = lim(target.limit, 20);
+      return { target: { type: "instagram-hashtag", tag, limit }, key: `ig-hashtag:${tag}:${limit}`, ttlMs: 6 * HOUR };
+    }
+    case "instagram-search": {
+      const query = target.query.trim().toLowerCase().replace(/\s+/g, " ");
+      const limit = lim(target.limit, 30);
+      return { target: { type: "instagram-search", query, limit }, key: `ig-search:${query}:${limit}`, ttlMs: 24 * HOUR };
+    }
+    case "instagram-tagged": {
+      const username = cleanHandle(target.username).toLowerCase();
+      const limit = lim(target.limit, 30);
+      return { target: { type: "instagram-tagged", username, limit }, key: `ig-tagged:${username}:${limit}`, ttlMs: 24 * HOUR };
+    }
+    case "instagram-place": {
+      const query = target.query.trim().toLowerCase().replace(/\s+/g, " ");
+      const limit = lim(target.limit, 30);
+      return { target: { type: "instagram-place", query, limit }, key: `ig-place:${query}:${limit}`, ttlMs: 12 * HOUR };
+    }
+    case "instagram-comments": {
+      const postUrls = [...new Set(target.postUrls)].sort();
+      const perPost = Math.min(Math.max(Math.round(target.perPost ?? 15), 1), 50);
+      const hash = createHash("sha1").update(postUrls.join(",")).digest("hex").slice(0, 16);
+      return { target: { type: "instagram-comments", postUrls, perPost }, key: `ig-comments:${hash}:${perPost}`, ttlMs: 7 * 24 * HOUR };
+    }
+    case "web-search": {
+      const query = target.query.trim().replace(/\s+/g, " ");
+      const limit = Math.min(Math.max(Math.round(target.limit ?? 10), 1), 50);
+      return { target: { type: "web-search", query, limit }, key: `web-search:${query.toLowerCase()}:${limit}`, ttlMs: 24 * HOUR };
+    }
+  }
+}
+
+async function runTarget(db: Db, target: Exclude<Target, { type: "url" }>, onStart: (id: string) => Promise<void>): Promise<Batch> {
+  switch (target.type) {
+    case "instagram-profile": return fetchInstagramProfiles(db, [target.username], { onStart });
+    case "instagram-hashtag": return fetchInstagramHashtag(db, target.tag, target.limit!, { onStart });
+    case "instagram-search": return fetchInstagramUserSearch(db, target.query, target.limit!, { onStart });
+    case "instagram-tagged": return fetchInstagramTagged(db, target.username, target.limit!, { onStart });
+    case "instagram-place": return fetchInstagramPlace(db, target.query, target.limit!, { onStart });
+    case "instagram-comments": return fetchInstagramComments(db, target.postUrls, target.perPost!, { onStart });
+    case "web-search": return { collected: (await searchFirecrawl(db, target.query, target.limit!)).map((item) => ({ item })), skipped: [] };
+  }
 }
 
 export type SaveResult = { items: ContentItem[]; ids: number[]; skipped: string[] };
@@ -137,14 +189,14 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
       .orderBy(desc(collectRuns.startedAt)).limit(1);
     // Порожній результат теж пам’ятаємо (годину), щоб повторний запит не запускав платний актор знову.
     if (last && last.itemIds.length === 0 && last.startedAt > new Date(Date.now() - Math.min(ttlMs, HOUR))) {
-      return { items: [], ids: [], cached: true, cachedAt: last.startedAt, notes: ["Минулого разу нічого не знайдено"], skipped: [] };
+      return { items: [], ids: [], cached: true, cachedAt: last.startedAt, notes: ["Минулого разу нічого не знайдено"], skipped: [], costUsd: 0 };
     }
     if (last?.itemIds.length) {
       const rows = await db.select().from(contentItems).where(inArray(contentItems.id, last.itemIds));
       const byId = new Map(rows.map((r) => [r.id, r]));
       const kept = last.itemIds.map((id) => byId.get(id)).filter((r) => r != null);
       const items = kept.map((r) => ContentItemSchema.safeParse(r.data)).flatMap((p) => (p.success ? [p.data] : []));
-      if (items.length) return { items, ids: kept.map((r) => r.id), cached: true, cachedAt: last.startedAt, notes, skipped: [] };
+      if (items.length) return { items, ids: kept.map((r) => r.id), cached: true, cachedAt: last.startedAt, notes, skipped: [], costUsd: 0 };
     }
   }
 
@@ -158,19 +210,14 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
     await db.update(collectRuns).set({ externalRunId }).where(eq(collectRuns.id, run.id));
   };
   try {
-    const batch =
-      target.type === "url"
-        ? await collectUrl(db, target.url, notes)
-        : target.type === "instagram-profile"
-          ? await fetchInstagramProfiles(db, [target.username], { onStart })
-          : await fetchInstagramHashtag(db, target.tag, target.limit!, { onStart });
+    const batch = target.type === "url" ? await collectUrl(db, target.url, notes) : await runTarget(db, target, onStart);
     const saved = await saveItems(db, batch.collected);
     const skipped = [...batch.skipped, ...saved.skipped];
-    if (saved.items.length === 0 && target.type !== "url") notes.push("Instagram нічого не повернув — перевірте назву");
+    if (saved.items.length === 0 && target.type !== "url") notes.push(target.type === "web-search" ? "Пошук нічого не знайшов" : "Instagram нічого не повернув — перевірте назву");
     await db.update(collectRuns)
       .set({ status: "done", itemIds: saved.ids, skipped: skipped.length, finishedAt: new Date() })
       .where(eq(collectRuns.id, run.id));
-    return { items: saved.items, ids: saved.ids, cached: false, notes, skipped };
+    return { items: saved.items, ids: saved.ids, cached: false, notes, skipped, costUsd: batch.costUsd ?? 0 };
   } catch (e) {
     await db.update(collectRuns)
       .set({ status: "failed", error: (e instanceof Error ? e.message : String(e)).slice(0, 2000), finishedAt: new Date() })
@@ -183,7 +230,7 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
  * Профілі пачкою — одним запуском актора (дешевше й швидше, ніж по одному).
  * Повертає сирі записи профілів разом з елементами; цілі з одним і тим самим набором імен кешуються 24 год.
  */
-export async function collectProfiles(db: Db, usernames: string[], opts: { fresh?: boolean } = {}): Promise<{ batch: Batch; ids: number[] }> {
+export async function collectProfiles(db: Db, usernames: string[], _opts: { fresh?: boolean } = {}): Promise<{ batch: Batch; ids: number[] }> {
   const names = [...new Set(usernames.map((u) => cleanHandle(u).toLowerCase()))].sort();
   if (names.length === 0) return { batch: { collected: [], skipped: [] }, ids: [] };
   const key = `ig-profiles:${createHash("sha1").update(names.join(",")).digest("hex").slice(0, 16)}:${names.length}`;

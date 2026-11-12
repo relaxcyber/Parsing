@@ -1,38 +1,59 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { auditCreator, type VisionAudit } from "@/audit/vision";
+import { readFile } from "node:fs/promises";
+import { and, eq, gte, inArray, isNotNull, sql } from "drizzle-orm";
+import { analyzeAds, adsReasons, type AdsReport } from "@/analysis/ads";
+import { analyzeComments, commentMetrics } from "@/analysis/comments";
+import { mergePosts, postFactsFromRaw, postMetrics, profilePosts, type CommentFacts, type PostFacts } from "@/analysis/posts";
+import { analyzeProfile, profileVerdict, PROFILE_PROMPT_VERSION, type ProfileAnalysis } from "@/analysis/profile";
+import { assessTrust, loadNorms, type Norms, type Risk, type Snapshot, type TrustReport } from "@/analysis/trust";
+import { adQualityIndex, deepAudit, DEEP_VERSION, type DeepAudit } from "@/audit/deep";
+import { auditCreator, AUDIT_VERSION, collagePath, scoreCollage, type VisionAudit } from "@/audit/vision";
 import { collect, collectProfiles } from "@/collect";
-import { getPageHtml } from "@/collect/html";
 import type { ContentItem } from "@/core/contract";
 import type { Db } from "@/db/client";
 import {
-  contentItems, creatorContacts, creators, searchCandidates, searches,
-  type Creator, type CreatorRate, type Search, type SearchProgress, type SearchStats,
+  contentItems, creatorContacts, creators, creatorSnapshots, searchCandidates, searches,
+  type Creator, type Search, type SearchProgress, type SearchStats, type SourceStats,
 } from "@/db/schema";
 import { activityOf, activityStatus } from "@/enrich/activity";
 import { detectCountry, detectLanguage } from "@/enrich/geo";
-import { checkEmail, usable, type EmailCheck } from "@/enrich/email";
-import { extractLinkPage } from "@/enrich/linkpage";
 import { classifyLinks } from "@/enrich/links";
 import { LlmUnavailableError } from "@/llm/client";
-import { extractEmails, overall, readinessIndex, scoreCandidate } from "./signals";
-import { emailKey, suppressedSet, usernameKey } from "./suppress";
+import { criteriaOf, DEFAULT_CRITERIA, evaluateCriteria, weightedScore, weightsOf, type CreatorFacts } from "./criteria";
+import { enrichCreator } from "./enrich";
+import { readinessIndex, scoreCandidate } from "./signals";
+import { expansionTags, planSources, PRICE, seedTags, sourcesOf, type Found, type SourceTask } from "./sources";
+import { suppressedSet, usernameKey } from "./suppress";
 
 /** Приблизна ціна одного результату актора Apify, $. */
-export const PRICE_PER_RESULT_USD = 0.0026;
+export const PRICE_PER_RESULT_USD = PRICE.post;
 const DAY = 86_400_000;
 /** Профіль і сторінки-візитки, зібрані не давніше цього, повторно не запитуємо. */
 const PROFILE_FRESH_MS = 7 * DAY;
 const LINKS_FRESH_MS = 7 * DAY;
 const AUDIT_FRESH_MS = 30 * DAY;
+const COMMENTS_FRESH_MS = 30 * DAY;
+/** Пам’ять відмов: магазин чи закритий профіль не перевіряємо (і не оплачуємо) знову 90 днів. */
+const HARD_REJECT_MS = 90 * DAY;
 const PROFILE_CHUNK = 50;
-/** Пороги якості: нижче MIN — відхиляємо, від LEAD — «готовий лід». */
-export const QUALITY_MIN = 40;
-export const QUALITY_LEAD = 70;
-const SUSPICIOUS_MIN_FOLLOWERS = 5000;
-const SUSPICIOUS_ER = 0.003;
+/** Скільки авторів за пошук читає модель-аналітик (кешується, тож повтор нічого не коштує). */
+const ANALYSIS_LIMIT = 80;
+const COMMENT_POSTS = 3;
+const COMMENTS_PER_POST = 10;
+/** Оцінка ближче за цю відстань до порога — «біля порога»: потрібна друга думка або ваш погляд. */
+const BORDER = 7;
+const MAX_EXPANSIONS = 2;
+/** Пороги якості за замовчуванням: нижче MIN — відхиляємо, від LEAD — «готовий лід». */
+export const QUALITY_MIN = DEFAULT_CRITERIA.quality.min;
+export const QUALITY_LEAD = DEFAULT_CRITERIA.quality.lead;
 
-export const estimateCostUsd = (s: Pick<Search, "hashtags" | "postsPerTag" | "maxProfiles">) =>
-  Math.round((s.hashtags.length * s.postsPerTag + s.maxProfiles) * PRICE_PER_RESULT_USD * 100) / 100;
+/** Оцінка максимальних витрат Apify: усі джерела, усі профілі й платні коментарі (або бюджет, якщо він менший). */
+export function estimateCostUsd(s: Search): number {
+  const sources = planSources(s).reduce((a, t) => a + t.estimateUsd, 0);
+  const seeds = sourcesOf(s).seeds.length * PRICE.profile;
+  const comments = s.commentsLimit * COMMENT_POSTS * COMMENTS_PER_POST * PRICE.comment;
+  const total = sources + seeds + s.maxProfiles * PRICE.profile + comments;
+  return Math.round(Math.min(total, s.budgetUsd ?? Infinity) * 100) / 100;
+}
 
 class Cancelled extends Error {}
 
@@ -42,7 +63,6 @@ async function setProgress(db: Db, id: number, progress: SearchProgress, stats?:
 }
 
 const postText = (p: ContentItem) => [p.text ?? "", p.tags.map((t) => `#${t}`).join(" ")].join("\n");
-const coverOf = (p: ContentItem) => p.media[0]?.thumbnailUrl ?? (p.media[0]?.type === "image" ? p.media[0].url : undefined);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function mapLimit<T>(items: T[], limit: number, fn: (item: T, index: number) => Promise<void>): Promise<void> {
@@ -55,329 +75,208 @@ async function mapLimit<T>(items: T[], limit: number, fn: (item: T, index: numbe
   }));
 }
 
-/** Сторінки-візитки автора: до двох посилань, спершу відомі сервіси, потім власні сайти. */
-function pagesToVisit(c: Creator): string[] {
-  const { hubs } = classifyLinks(c.links);
-  const others = c.links.filter((l) => !hubs.includes(l) && !/(instagram|tiktok|youtube|facebook|amazon|amzn|shopltk|liketk|shopmy|spotify|apple|google|whatsapp|t\.me|x\.com|twitter)\./i.test(l));
-  return [...hubs, ...others].slice(0, 2);
-}
-
-type Enrichment = { emails: { email: string; source: string; sourceUrl: string }[]; rates: CreatorRate[]; portfolio: string[]; affiliate: string[]; socials: Record<string, string>; pages: number };
-
-/** Безкоштовне збагачення: біо + посилання профілю + сторінки-візитки. */
-async function enrich(c: Creator): Promise<Enrichment> {
-  const profileUrl = `https://www.instagram.com/${c.username}/`;
-  const fromProfile = classifyLinks(c.links);
-  const out: Enrichment = {
-    emails: extractEmails(c.bio).map((email) => ({ email, source: "bio", sourceUrl: profileUrl })),
-    rates: [], portfolio: [...fromProfile.portfolio], affiliate: [...fromProfile.affiliate], socials: { ...fromProfile.socials }, pages: 0,
-  };
-  for (const url of pagesToVisit(c)) {
-    let page;
-    try {
-      page = await getPageHtml(url);
-    } catch {
-      continue; // внутрішня адреса чи некоректне посилання
-    }
-    if ("error" in page) continue;
-    out.pages++;
-    const data = extractLinkPage(page.html, url);
-    for (const e of data.emails) if (!out.emails.some((x) => x.email === e.email)) out.emails.push({ email: e.email, source: "link_page", sourceUrl: url });
-    for (const o of data.offers) if (o.ugcRate) out.rates.push({ title: o.title, amount: o.amount, currency: o.currency, sourceUrl: url });
-    out.portfolio.push(...data.portfolio);
-    out.affiliate.push(...data.affiliate);
-    out.socials = { ...data.socials, ...out.socials };
-  }
-  out.portfolio = [...new Set(out.portfolio)].slice(0, 5);
-  out.affiliate = [...new Set(out.affiliate)];
-  out.rates = out.rates.slice(0, 10);
-  return out;
-}
-
 const EMAIL_RANK: Record<string, number> = { personal: 4, business: 3, unknown: 2, role: 1 };
+const RISK_LABEL: Record<Risk, string> = { low: "низький", medium: "середній", high: "високий", unknown: "невідомий" };
+
+type Author = Found & { source: string };
+type Ctx = {
+  db: Db;
+  search: Search;
+  criteria: ReturnType<typeof criteriaOf>;
+  weights: ReturnType<typeof weightsOf>;
+  stats: SearchStats;
+  now: Date;
+  norms: Norms;
+  spent: number;
+  budget: number | null;
+  left: { shortlist: number; audits: number; deep: number; comments: number; analysis: number };
+  examples?: string;
+  authors: Map<string, Author>;
+  /** Автори з попередніх запусків цієї серії (повторний пошук показує лише нових). */
+  series: Set<string>;
+  qualified: Set<string>;
+  /** Уже оцінені в попередніх хвилях. */
+  done: Set<string>;
+  llmDown: string | null;
+  notes: string[];
+};
+
+const canSpend = (ctx: Ctx, usd: number) => ctx.budget == null || ctx.spent + usd <= ctx.budget + 1e-9;
+
+function sourceStats(ctx: Ctx, label: string): SourceStats {
+  ctx.stats.bySource ??= {};
+  return (ctx.stats.bySource[label] ??= { authors: 0, qualified: 0, leads: 0, costUsd: 0 });
+}
+
+function charge(ctx: Ctx, usd: number, label?: string) {
+  if (!usd) return;
+  ctx.spent += usd;
+  ctx.stats.costUsd = Math.round(ctx.spent * 10000) / 10000;
+  if (label) sourceStats(ctx, label).costUsd = Math.round((sourceStats(ctx, label).costUsd + usd) * 10000) / 10000;
+}
 
 /**
- * Воронка: хештеги → безкоштовний відбір за текстом → профілі найкращих одним запуском →
- * активність → сторінки-візитки й перевірка email → три індекси → візуальний аудит найкращих.
- * Кроки ідемпотентні (збір і збагачення кешуються), тому перерваний пошук можна просто запустити знову.
+ * Запит до мовної моделі з урахуванням лімітів: коротка пауза, якщо ліміт хвилинний; якщо моделі
+ * недоступні надовго — решта кроків із моделлю пропускається, а пошук іде далі без них.
+ */
+async function withLlm<T>(ctx: Ctx, fn: () => Promise<T>): Promise<T | Error | null> {
+  if (ctx.llmDown) return null;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (e instanceof LlmUnavailableError && e.retryAt && e.retryAt.getTime() - Date.now() < 90_000 && attempt < 3) {
+        await sleep(Math.max(1000, e.retryAt.getTime() - Date.now() + 500));
+        continue;
+      }
+      if (e instanceof LlmUnavailableError) {
+        ctx.llmDown = e.message;
+        return null;
+      }
+      return e instanceof Error ? e : new Error(String(e));
+    }
+  }
+}
+
+/** Ваші минулі рішення як орієнтир для моделі: що ви брали і що відхиляли. */
+async function verdictExamples(db: Db): Promise<string | undefined> {
+  const rows = await db.select({ v: creators.manualVerdict, audit: creators.audit }).from(creators)
+    .where(and(isNotNull(creators.manualVerdict), eq(creators.auditVersion, AUDIT_VERSION))).limit(200);
+  const line = (a: Record<string, unknown> | null) => {
+    const au = a as VisionAudit | null;
+    if (!au?.summary) return null;
+    const s = au.scores ? Object.entries(au.scores).map(([k, v]) => `${k} ${v.score ?? "?"}`).join(", ") : "";
+    return `- ${au.aesthetic ? `${au.aesthetic}: ` : ""}${au.summary} (${s})`;
+  };
+  const yes = rows.filter((r) => r.v === "yes").map((r) => line(r.audit)).filter(Boolean).slice(0, 3);
+  const no = rows.filter((r) => r.v === "no").map((r) => line(r.audit)).filter(Boolean).slice(0, 3);
+  if (!yes.length || !no.length) return undefined;
+  return `For calibration, this team's past decisions on other creators (match their bar, do not copy the text):\nACCEPTED:\n${yes.join("\n")}\nREJECTED:\n${no.join("\n")}`;
+}
+
+/** Імена авторів, що вже були кандидатами в попередніх запусках цієї серії. */
+async function seriesUsernames(db: Db, search: Search): Promise<Set<string>> {
+  const ids: number[] = [];
+  let parent = search.parentId;
+  for (let i = 0; parent && i < 50; i++) {
+    ids.push(parent);
+    const [p] = await db.select({ parentId: searches.parentId }).from(searches).where(eq(searches.id, parent));
+    parent = p?.parentId ?? null;
+  }
+  // Пошуки-«брати»: усі, кого той самий батько породив раніше.
+  if (search.parentId) {
+    const siblings = await db.select({ id: searches.id }).from(searches).where(and(eq(searches.parentId, search.parentId), sql`${searches.id} < ${search.id}`));
+    ids.push(...siblings.map((s) => s.id));
+  }
+  if (!ids.length) return new Set();
+  const rows = await db.select({ username: creators.username }).from(searchCandidates)
+    .innerJoin(creators, eq(searchCandidates.creatorId, creators.id)).where(inArray(searchCandidates.searchId, ids));
+  return new Set(rows.map((r) => r.username));
+}
+
+/**
+ * Воронка пошуку хвилями: джерела (хештеги, пошук за біо, відмітки брендів, місця, веб, список)
+ * → безкоштовний відбір за текстом → профілі (платно) → цифри, довіра, реклама → аналіз тексту
+ * моделлю → контакти → візуальний аудит → глибокий аудит роликів → коментарі → підсумок.
+ * Якщо задано мету за лідами чи бюджет, джерела запускаються по одному, і пошук зупиняється, щойно
+ * мети досягнуто; коли джерела закінчились, а мета ні — додаються хештеги, знайдені в дописах
+ * авторів, що пройшли відбір. Кроки кешуються, тож перерваний пошук можна просто запустити знову.
  */
 export async function runSearch(db: Db, searchId: number): Promise<void> {
   const [search] = await db.select().from(searches).where(eq(searches.id, searchId));
   if (!search) return;
-  const stats: SearchStats = {};
-  const scoreArgs = { keywords: search.keywords, stopWords: search.stopWords, ignoreTags: search.hashtags, focus: search.focus };
+  const ctx: Ctx = {
+    db, search, criteria: criteriaOf(search), weights: weightsOf(search), stats: { posts: 0 }, now: new Date(), norms: await loadNorms(db),
+    spent: 0, budget: search.budgetUsd ?? null,
+    left: { shortlist: search.maxProfiles, audits: search.auditLimit, deep: search.deepLimit, comments: search.commentsLimit, analysis: ANALYSIS_LIMIT },
+    authors: new Map(), series: new Set(), qualified: new Set(), done: new Set(), llmDown: null, notes: [],
+  };
+  const { stats } = ctx;
   try {
-    // 1. Дописи за хештегами.
-    const posts = new Map<string, { item: ContentItem; id: number }>();
-    for (const [i, tag] of search.hashtags.entries()) {
-      await setProgress(db, searchId, { stage: `Збираю дописи #${tag}`, done: i, total: search.hashtags.length });
-      const r = await collect(db, { type: "instagram-hashtag", tag, limit: search.postsPerTag });
-      r.items.forEach((item, n) => posts.set(item.id, { item, id: r.ids[n] }));
-    }
-    stats.posts = posts.size;
-
-    // 2. Групуємо за автором; авторів зі списку виключень не чіпаємо взагалі.
-    const byAuthor = new Map<string, { displayName?: string; externalId?: string; posts: { item: ContentItem; id: number }[] }>();
-    for (const p of posts.values()) {
-      const username = p.item.author?.username?.toLowerCase();
-      if (!username) continue;
-      const entry = byAuthor.get(username) ?? { posts: [] };
-      entry.displayName ??= p.item.author?.displayName;
-      entry.externalId ??= p.item.author?.id;
-      entry.posts.push(p);
-      byAuthor.set(username, entry);
-    }
-    const suppressed = await suppressedSet(db, [...byAuthor.keys()].map((u) => usernameKey(search.platform, u)));
-    for (const u of [...byAuthor.keys()]) if (suppressed.has(usernameKey(search.platform, u))) byAuthor.delete(u);
-    stats.authors = byAuthor.size;
-    await setProgress(db, searchId, { stage: "Відбираю авторів за текстом", done: 0, total: byAuthor.size }, stats);
-    if (byAuthor.size === 0) {
-      await db.update(searches).set({ status: "done", stats, finishedAt: new Date(), progress: null }).where(eq(searches.id, searchId));
-      return;
-    }
-
-    const names = [...byAuthor.keys()];
-    for (let i = 0; i < names.length; i += 200) {
-      await db.insert(creators)
-        .values(names.slice(i, i + 200).map((username) => ({
-          platform: search.platform, username,
-          displayName: byAuthor.get(username)!.displayName ?? null, externalId: byAuthor.get(username)!.externalId ?? null,
-        })))
-        .onConflictDoNothing({ target: [creators.platform, creators.username] });
-    }
-    const loadCreators = async (usernames: string[]) =>
-      usernames.length ? db.select().from(creators).where(and(eq(creators.platform, search.platform), inArray(creators.username, usernames))) : [];
-    const creatorBy = new Map((await loadCreators(names)).map((c) => [c.username, c]));
-    const textsOf = (username: string) => byAuthor.get(username)!.posts.map((p) => postText(p.item));
-
-    // 3. Безкоштовний відбір за підписами (і біо, якщо профіль уже є).
-    const scored = names.map((username) => {
-      const c = creatorBy.get(username)!;
-      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(username), bio: c.bio, affiliate: c.affiliate, names: [c.username, c.displayName] });
-      return { username, creator: c, postIds: byAuthor.get(username)!.posts.map((p) => p.id), ...s };
-    });
-    scored.sort((a, b) => b.fit - a.fit || b.postIds.length - a.postIds.length || a.username.localeCompare(b.username));
-    // Магазини, агенції та стоп-слова відсіюємо одразу. Автори без текстових сигналів ідуть у кінець
-    // черги: сам хештег пошуку — слабка ознака, тож профіль їм беремо, лише якщо лишилося місце в ліміті.
-    const shortlist = scored.filter((s) => !s.blocked && !s.negative).slice(0, search.maxProfiles);
-    const shortSet = new Set(shortlist.map((s) => s.username));
-    stats.shortlisted = shortlist.length;
-
-    for (let i = 0; i < scored.length; i += 200) {
-      await db.insert(searchCandidates)
-        .values(scored.slice(i, i + 200).map((s) => ({
-          searchId, creatorId: s.creator.id, postIds: s.postIds, fit: s.fit, score: s.fit,
-          stage: shortSet.has(s.username) ? ("shortlisted" as const) : ("filtered_out" as const),
-          reasons: shortSet.has(s.username)
-            ? s.reasons
-            : [...s.reasons, s.blocked ? "відсіяно стоп-словом" : s.negative ? "відсіяно за текстом дописів" : "не увійшов до ліміту профілів"],
-        })))
-        .onConflictDoUpdate({
-          target: [searchCandidates.searchId, searchCandidates.creatorId],
-          set: {
-            postIds: sql`excluded.post_ids`, fit: sql`excluded.fit`, readiness: sql`null`, quality: sql`null`, lead: sql`false`,
-            score: sql`excluded.score`, stage: sql`excluded.stage`, reasons: sql`excluded.reasons`,
-          },
-        });
-    }
-
-    // 4. Профілі — лише для відібраних і лише тих, кого давно не збирали. Заодно рахуємо активність.
-    const now = new Date();
-    const freshAfter = new Date(now.getTime() - PROFILE_FRESH_MS);
-    const need = shortlist.filter((s) => !s.creator.profileFetchedAt || s.creator.profileFetchedAt < freshAfter).map((s) => s.username);
-    stats.profilesReused = shortlist.length - need.length;
-    stats.profilesFetched = 0;
-    /** Свіжі обкладинки дописів: посилання Instagram живуть недовго, тому аудит робимо в цьому ж проході. */
-    const covers = new Map<string, string[]>();
-    const videos = new Map<string, string[]>();
-    for (let i = 0; i < need.length; i += PROFILE_CHUNK) {
-      await setProgress(db, searchId, { stage: "Збираю профілі відібраних авторів", done: i, total: need.length }, stats);
-      const chunk = need.slice(i, i + PROFILE_CHUNK);
-      const { batch } = await collectProfiles(db, chunk);
-      const items = batch.collected.map((c) => c.item as ContentItem);
-      const seen = new Set<string>();
-      for (const { item, raw } of batch.collected) {
-        if (item.kind !== "profile" || !item.author?.username) continue;
-        const username = item.author.username.toLowerCase();
-        seen.add(username);
-        const r = (raw ?? {}) as Record<string, unknown>;
-        // Дописи самого автора (спільні дописи з чужих акаунтів не рахуємо).
-        const own = items.filter((p) => p.kind !== "profile" && p.author?.username?.toLowerCase() === username);
-        const act = activityOf(own.map((p) => ({ publishedAt: p.publishedAt ? new Date(p.publishedAt) : undefined, metrics: p.metrics ?? {} })), item.author.followers);
-        covers.set(username, own.map((p) => coverOf(p)).filter((u): u is string => !!u));
-        videos.set(username, own.flatMap((p) => (p.media ?? []).filter((m) => m.type === "video").map((m) => m.url)));
-        const likes = own.map((p) => p.metrics?.likes).filter((n): n is number => typeof n === "number").sort((a, b) => a - b);
-        const erLikes = likes.length && item.author.followers ? Math.round((likes[Math.floor(likes.length / 2)] / item.author.followers) * 10000) / 10000 : null;
-        const geo = detectCountry({ bio: item.author.bio, links: item.author.links });
-        const lang = detectLanguage([item.author.bio ?? "", ...own.map((p) => p.text ?? ""), ...(byAuthor.get(username)?.posts.map((p) => p.item.text ?? "") ?? [])].join("\n"));
-        await db.update(creators)
-          .set({
-            displayName: item.author.displayName ?? null, bio: item.author.bio ?? null, externalId: item.author.id ?? null,
-            followers: item.author.followers != null ? Math.round(item.author.followers) : null,
-            postsCount: typeof r.postsCount === "number" ? r.postsCount : null,
-            links: item.author.links ?? [], avatarUrl: item.author.avatarUrl ?? null, verified: item.author.verified ?? null,
-            isPrivate: typeof r.private === "boolean" ? r.private : null,
-            isBusiness: typeof r.isBusinessAccount === "boolean" ? r.isBusinessAccount : null,
-            lastPostAt: act.lastPostAt, medianViews: act.medianViews, erViews: act.erViews,
-            erLikes, country: geo.country, countryConfidence: geo.country ? geo.confidence : null, language: lang.language,
-            profileFetchedAt: now, updatedAt: now,
-          })
-          .where(and(eq(creators.platform, search.platform), eq(creators.username, username)));
-        stats.profilesFetched++;
-      }
-      // Профіль не повернувся (видалений, перейменований): позначаємо, щоб не питати щоразу.
-      const missing = chunk.filter((u) => !seen.has(u));
-      if (missing.length) {
-        await db.update(creators).set({ profileFetchedAt: now, updatedAt: now })
-          .where(and(eq(creators.platform, search.platform), inArray(creators.username, missing), sql`${creators.followers} is null`));
-      }
-    }
-
-    // 5. Жорсткі фільтри після профілю — до витрат на збагачення й аудит.
-    type Row = { c: Creator; fit: number; reasons: string[]; reject: string[] };
-    const rows: Row[] = [];
-    for (const c of await loadCreators(shortlist.map((s) => s.username))) {
-      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(c.username), bio: c.bio, affiliate: c.affiliate, names: [c.username, c.displayName] });
-      const reject: string[] = [];
-      if (c.followers == null && c.bio == null) reject.push("профіль не знайдено");
-      if (c.isPrivate) reject.push("закритий профіль");
-      if (search.minFollowers != null && c.followers != null && c.followers < search.minFollowers) reject.push(`замало підписників (${c.followers})`);
-      if (search.maxFollowers != null && c.followers != null && c.followers > search.maxFollowers) reject.push(`забагато підписників (${c.followers})`);
-      if (s.blocked) reject.push("відсіяно стоп-словом");
-      if (s.negative) reject.push("не окремий автор (магазин, агенція чи платформа)");
-      if (activityStatus(c.lastPostAt, now) === "ghost") reject.push("не публікує понад 30 днів");
-      // Країну й мову знаємо не завжди: невизначені проходять, явно інші — відсіюються.
-      if (search.countries.length && c.country && !search.countries.includes(c.country)) reject.push(`інша країна (${c.country})`);
-      if (search.languages.length && c.language && !search.languages.includes(c.language)) reject.push(`інша мова (${c.language})`);
-      rows.push({ c, fit: s.fit, reasons: s.reasons, reject });
-    }
-    const alive = rows.filter((r) => r.reject.length === 0);
-
-    // 6. Сторінки-візитки та перевірка email (безкоштовно).
-    stats.linkPages = 0;
-    let done = 0;
-    const linksFreshAfter = new Date(now.getTime() - LINKS_FRESH_MS);
-    await mapLimit(alive, 3, async (row) => {
-      if (!row.c.linksCheckedAt || row.c.linksCheckedAt < linksFreshAfter || row.c.linksCheckedAt < (row.c.profileFetchedAt ?? row.c.linksCheckedAt)) {
-        const e = await enrich(row.c);
-        stats.linkPages! += e.pages;
-        const blockedEmails = await suppressedSet(db, e.emails.map((x) => emailKey(x.email)));
-        const checks: (EmailCheck & { source: string; sourceUrl: string })[] = [];
-        for (const found of e.emails.filter((x) => !blockedEmails.has(emailKey(x.email))).slice(0, 5)) {
-          checks.push({ ...(await checkEmail(found.email)), source: found.source, sourceUrl: found.sourceUrl });
-        }
-        if (checks.length) {
-          await db.insert(creatorContacts)
-            .values(checks.map((k) => ({ creatorId: row.c.id, email: k.email, status: k.status, confidence: k.confidence, mx: k.mx, source: k.source, sourceUrl: k.sourceUrl })))
-            .onConflictDoUpdate({
-              target: [creatorContacts.creatorId, creatorContacts.email],
-              set: { status: sql`excluded.status`, confidence: sql`excluded.confidence`, mx: sql`excluded.mx`, checkedAt: new Date() },
-            });
-        }
-        const good = checks.filter(usable).sort((a, b) => b.confidence - a.confidence).map((k) => k.email);
-        const [updated] = await db.update(creators)
-          .set({ emails: good, rates: e.rates, portfolio: e.portfolio, affiliate: e.affiliate, socials: e.socials, linksCheckedAt: new Date(), updatedAt: new Date() })
-          .where(eq(creators.id, row.c.id)).returning();
-        if (updated) row.c = updated;
-      }
-      if (++done % 5 === 0 || done === alive.length) {
-        await setProgress(db, searchId, { stage: "Шукаю контакти на сторінках-візитках", done, total: alive.length }, stats);
-      }
-    });
-
-    // 7. Fit і Readiness з урахуванням знайденого.
-    const contactRows = alive.length
-      ? await db.select().from(creatorContacts).where(inArray(creatorContacts.creatorId, alive.map((r) => r.c.id)))
-      : [];
-    type Ranked = Row & { readiness: number; bestEmail: string | null };
-    const ranked: Ranked[] = alive.map((row) => {
-      const s = scoreCandidate({ ...scoreArgs, texts: textsOf(row.c.username), bio: row.c.bio, affiliate: row.c.affiliate, names: [row.c.username, row.c.displayName] });
-      const best = contactRows.filter((k) => k.creatorId === row.c.id && row.c.emails.includes(k.email))
-        .sort((a, b) => (EMAIL_RANK[b.status] ?? 0) - (EMAIL_RANK[a.status] ?? 0))[0];
-      const days = row.c.lastPostAt ? Math.floor((now.getTime() - row.c.lastPostAt.getTime()) / DAY) : null;
-      const r = readinessIndex({
-        emailStatus: best?.status, daysSincePost: days, hasRate: row.c.rates.length > 0,
-        hasPortfolio: row.c.portfolio.length > 0 || classifyLinks(row.c.links).hubs.length > 0,
-      });
-      return { ...row, fit: s.fit, reasons: [...s.reasons, ...r.reasons], readiness: r.readiness, bestEmail: best?.status ?? null };
-    });
-    stats.withEmail = ranked.filter((r) => r.c.emails.length > 0).length;
-    ranked.sort((a, b) => overall(b.fit, b.readiness) - overall(a.fit, a.readiness));
-
-    // 8. Візуальний аудит найкращих (Quality). Витрачає ліміт мовної моделі, тому обмежений.
-    stats.audited = 0;
-    const auditFreshAfter = new Date(now.getTime() - AUDIT_FRESH_MS);
-    const toAudit = ranked.slice(0, search.auditLimit);
-    let llmDown: string | null = null;
-    for (const [i, row] of toAudit.entries()) {
-      if (row.c.auditedAt && row.c.auditedAt > auditFreshAfter && row.c.quality != null) continue;
-      if (llmDown) break;
-      await setProgress(db, searchId, { stage: "Оцінюю якість візуалу", done: i, total: toAudit.length }, stats);
-      let urls = covers.get(row.c.username) ?? [];
-      if (urls.length === 0) {
-        const stored = await db.select({ data: contentItems.data }).from(contentItems)
-          .where(and(eq(contentItems.source, search.platform), eq(contentItems.authorUsername, row.c.username)))
-          .orderBy(desc(contentItems.fetchedAt)).limit(12);
-        urls = stored.map((r) => coverOf(r.data)).filter((u): u is string => !!u);
-      }
-      for (let attempt = 0; ; attempt++) {
+    ctx.series = await seriesUsernames(db, search);
+    ctx.examples = await verdictExamples(db);
+    const used = new Set(search.hashtags);
+    const extraTags: string[] = [];
+    const seeds = sourcesOf(search).seeds;
+    if (seeds.length) {
+      if (canSpend(ctx, seeds.length * PRICE.profile)) {
+        await setProgress(db, searchId, { stage: "Вивчаю авторів-зразків", done: 0, total: seeds.length }, stats);
         try {
-          const result = await auditCreator(db, row.c.id, { covers: urls, videos: videos.get(row.c.username) });
-          if ("skipped" in result) row.reasons.push(`аудит пропущено: ${result.skipped}`);
-          else {
-            const [updated] = await db.update(creators)
-              .set({ quality: result.quality, audit: result.audit, auditedAt: new Date() }).where(eq(creators.id, row.c.id)).returning();
-            if (updated) row.c = updated;
-            stats.audited++;
-          }
-          break;
+          const r = await seedTags(db, seeds, used);
+          charge(ctx, r.costUsd, "схожі на зразки");
+          extraTags.push(...r.tags);
+          r.tags.forEach((t) => used.add(t));
+          ctx.notes.push(r.tags.length ? `Хештеги зразків: ${r.tags.map((t) => `#${t}`).join(" ")}` : "У зразків не знайшлося спільних хештегів");
         } catch (e) {
-          // Вичерпано хвилинний ліміт моделі — коротка пауза; надовго — зупиняємо аудит, решта лишиться без Quality.
-          if (e instanceof LlmUnavailableError && e.retryAt && e.retryAt.getTime() - Date.now() < 90_000 && attempt < 3) {
-            await sleep(Math.max(1000, e.retryAt.getTime() - Date.now() + 500));
-            continue;
+          ctx.notes.push(`Зразки: ${(e instanceof Error ? e.message : String(e)).slice(0, 160)}`);
+        }
+      } else ctx.notes.push("Зразки пропущено: не вистачає бюджету");
+    }
+
+    const queue: SourceTask[] = planSources(search, extraTags).map((t) => (extraTags.some((x) => t.label === `#${x}`) ? { ...t, label: `${t.label} (схожі на зразки)` } : t));
+    const autopilot = search.targetLeads != null;
+    const errors: string[] = [];
+    let ran = 0;
+    let expansions = 0;
+    stats.waves = 0;
+
+    while (queue.length) {
+      // Без мети — одна хвиля з усіма джерелами; з метою — по джерелу, щоб зупинитися якомога раніше.
+      const wave = autopilot ? queue.splice(0, 1) : queue.splice(0);
+      for (const [i, task] of wave.entries()) {
+        if (!canSpend(ctx, task.estimateUsd)) {
+          ctx.notes.push(`${task.label}: пропущено — не вистачає бюджету`);
+          continue;
+        }
+        await setProgress(db, searchId, { stage: `Збираю: ${task.label}`, done: i, total: wave.length }, stats);
+        try {
+          const r = await task.run(db);
+          ran++;
+          charge(ctx, r.costUsd, task.label);
+          stats.posts = (stats.posts ?? 0) + r.posts;
+          ctx.notes.push(...r.notes);
+          for (const f of r.found) {
+            const prev = ctx.authors.get(f.username);
+            if (prev) {
+              for (const p of f.posts) if (!prev.posts.some((x) => x.id === p.id)) prev.posts.push(p);
+            } else ctx.authors.set(f.username, { ...f, source: task.label });
           }
-          if (e instanceof LlmUnavailableError) llmDown = e.message;
-          else row.reasons.push(`аудит не вдався: ${(e instanceof Error ? e.message : String(e)).slice(0, 80)}`);
-          break;
+        } catch (e) {
+          errors.push(`${task.label}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      const fresh = [...ctx.authors.keys()].filter((u) => !ctx.done.has(u));
+      if (fresh.length) {
+        await evaluate(ctx, fresh);
+        stats.waves++;
+      }
+      fresh.forEach((u) => ctx.done.add(u));
+      if (autopilot && (stats.leads ?? 0) >= search.targetLeads!) {
+        ctx.notes.push(`Мету досягнуто: ${stats.leads} готових лідів`);
+        break;
+      }
+      if (autopilot && !queue.length && expansions < MAX_EXPANSIONS && ctx.qualified.size) {
+        const tags = expansionTags([...ctx.qualified].map((u) => ctx.authors.get(u)?.posts.map((p) => p.item) ?? []), used, search.stopWords);
+        if (tags.length) {
+          expansions++;
+          tags.forEach((t) => used.add(t));
+          stats.expandedTags = [...(stats.expandedTags ?? []), ...tags];
+          queue.push(...planSources({ ...search, hashtags: tags, sources: {} }).map((t) => ({ ...t, label: `${t.label} (знайдено в дописах)` })));
         }
       }
     }
-    if (llmDown) stats.note = `Візуальний аудит зупинено: ${llmDown.slice(0, 200)}. Запустіть пошук знову пізніше — оцінені автори не перераховуються.`;
-
-    // 9. Підсумок: відхилення за аудитом, загальна оцінка, «готові ліди».
-    let qualified = 0;
-    let leads = 0;
-    const finalRows = [
-      ...ranked.map((row) => {
-        const audit = row.c.audit as VisionAudit | null;
-        const quality = row.c.quality;
-        const reject: string[] = [];
-        if (audit?.minor_is_main_subject) reject.push("головні герої контенту — діти");
-        if (audit && (audit.brand_safety_flags.length > 0 || audit.rejection_reasons.includes("BRAND_UNSAFE"))) reject.push(`небезпечно для бренду: ${audit.brand_safety_flags.join(", ") || "позначено моделлю"}`);
-        if (quality != null && quality < QUALITY_MIN) reject.push(`низька якість зйомки (${Math.round(quality)})`);
-        const ok = reject.length === 0;
-        const active = activityStatus(row.c.lastPostAt, now) === "active";
-        // Велика аудиторія при майже нульових вподобаннях — типова ознака накрутки.
-        const suspicious = row.c.followers != null && row.c.followers >= SUSPICIOUS_MIN_FOLLOWERS && row.c.erLikes != null && row.c.erLikes < SUSPICIOUS_ER;
-        if (suspicious) row.reasons.push(`мінус: залученість ${(row.c.erLikes! * 100).toFixed(2)}% — можлива накрутка підписників`);
-        if (search.countries.length && !row.c.country) row.reasons.push("країну не визначено");
-        const lead = ok && active && !suspicious && (row.bestEmail === "personal" || row.bestEmail === "business") && quality != null && quality >= QUALITY_LEAD;
-        if (ok) qualified++;
-        if (lead) leads++;
-        return { row, stage: ok ? ("qualified" as const) : ("rejected" as const), quality, readiness: row.readiness as number | null, reasons: [...row.reasons, ...reject], lead };
-      }),
-      ...rows.filter((r) => r.reject.length > 0).map((row) => ({ row, stage: "rejected" as const, quality: null, readiness: null, reasons: [...row.reasons, ...row.reject], lead: false })),
-    ];
-    for (const f of finalRows) {
-      await db.update(searchCandidates)
-        .set({ stage: f.stage, fit: f.row.fit, readiness: f.readiness, quality: f.quality, score: overall(f.row.fit, f.readiness, f.quality), reasons: f.reasons, lead: f.lead })
-        .where(and(eq(searchCandidates.searchId, searchId), eq(searchCandidates.creatorId, f.row.c.id)));
+    if (ran === 0 && errors.length) throw new Error(errors.join("; ").slice(0, 2000));
+    if (autopilot && (stats.leads ?? 0) < search.targetLeads!) ctx.notes.push(`Мету не досягнуто: ${stats.leads ?? 0} з ${search.targetLeads} лідів`);
+    ctx.notes.push(...errors.map((e) => e.slice(0, 300)));
+    if (ctx.llmDown) {
+      stats.note = `Мовна модель недоступна: ${ctx.llmDown.slice(0, 200)}. Аналіз тексту й візуальний аудит зупинено — запустіть пошук знову пізніше, уже оцінені автори не перераховуються.`;
     }
-    stats.qualified = qualified;
-    stats.leads = leads;
+    stats.authors = ctx.authors.size;
+    stats.notes = ctx.notes.slice(0, 30);
     await db.update(searches).set({ status: "done", stats, finishedAt: new Date(), progress: null, error: null }).where(eq(searches.id, searchId));
   } catch (e) {
+    stats.authors = ctx.authors.size;
+    stats.notes = ctx.notes.slice(0, 30);
     if (e instanceof Cancelled) {
       await db.update(searches).set({ finishedAt: new Date(), progress: null, stats }).where(eq(searches.id, searchId));
       return;
@@ -388,8 +287,477 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
   }
 }
 
+type Row = {
+  c: Creator;
+  source: string;
+  fit: number;
+  reasons: string[];
+  reject: string[];
+  posts: PostFacts[];
+  covers: string[];
+  videos: string[];
+  ads: AdsReport | null;
+  trust: TrustReport | null;
+  comments: CommentFacts[];
+};
+
+/** Оцінка нових авторів однієї хвилі — від безкоштовних кроків до платних. */
+async function evaluate(ctx: Ctx, names: string[]): Promise<void> {
+  const { db, search, stats, now } = ctx;
+  const scoreArgs = { keywords: search.keywords, stopWords: search.stopWords, ignoreTags: search.hashtags, focus: search.focus };
+
+  // 1. Список виключень: таких авторів не створюємо й не показуємо взагалі.
+  const suppressed = await suppressedSet(db, names.map((u) => usernameKey(search.platform, u)));
+  names = names.filter((u) => !suppressed.has(usernameKey(search.platform, u)));
+  if (!names.length) return;
+  for (let i = 0; i < names.length; i += 200) {
+    await db.insert(creators)
+      .values(names.slice(i, i + 200).map((username) => ({
+        platform: search.platform, username, displayName: ctx.authors.get(username)!.displayName ?? null, externalId: ctx.authors.get(username)!.externalId ?? null,
+      })))
+      .onConflictDoNothing({ target: [creators.platform, creators.username] });
+  }
+  const load = async (usernames: string[]) =>
+    usernames.length ? db.select().from(creators).where(and(eq(creators.platform, search.platform), inArray(creators.username, usernames))) : [];
+  const creatorBy = new Map((await load(names)).map((c) => [c.username, c]));
+  const textsOf = (u: string) => ctx.authors.get(u)!.posts.map((p) => postText(p.item));
+
+  // 2. Безкоштовний відбір: відомі відмови, уже в роботі, попередні запуски серії, текст дописів і біо.
+  const known = (c: Creator): string | null => {
+    if (ctx.series.has(c.username)) return "вже був у попередньому запуску цього пошуку";
+    if (search.excludeContacted && c.outreachStatus !== "new") return `уже в роботі (${c.outreachStatus})`;
+    if (c.hardReject && c.hardRejectAt && now.getTime() - c.hardRejectAt.getTime() < HARD_REJECT_MS) return `раніше відхилено: ${c.hardReject}`;
+    return null;
+  };
+  const scored = names.map((username) => {
+    const c = creatorBy.get(username)!;
+    const s = scoreCandidate({ ...scoreArgs, texts: textsOf(username), bio: c.bio, affiliate: c.affiliate, names: [c.username, c.displayName] });
+    return { username, c, known: known(c), postIds: ctx.authors.get(username)!.posts.map((p) => p.id), source: ctx.authors.get(username)!.source, ...s };
+  });
+  scored.sort((a, b) => b.fit - a.fit || b.postIds.length - a.postIds.length || a.username.localeCompare(b.username));
+  const eligible = scored.filter((s) => !s.known && !s.blocked && !s.negative);
+  const shortlist = eligible.slice(0, Math.max(0, ctx.left.shortlist));
+  ctx.left.shortlist -= shortlist.length;
+  const shortSet = new Set(shortlist.map((s) => s.username));
+  stats.shortlisted = (stats.shortlisted ?? 0) + shortlist.length;
+  stats.skippedKnown = (stats.skippedKnown ?? 0) + scored.filter((s) => s.known?.startsWith("раніше")).length;
+  for (const s of scored) sourceStats(ctx, s.source).authors++;
+
+  for (let i = 0; i < scored.length; i += 200) {
+    await db.insert(searchCandidates)
+      .values(scored.slice(i, i + 200).map((s) => ({
+        searchId: search.id, creatorId: s.c.id, postIds: s.postIds, fit: s.fit, score: s.fit, source: s.source,
+        stage: shortSet.has(s.username) ? ("shortlisted" as const) : ("filtered_out" as const),
+        reasons: shortSet.has(s.username)
+          ? s.reasons
+          : [...s.reasons, s.known ?? (s.blocked ? "відсіяно стоп-словом" : s.negative ? "відсіяно за текстом дописів" : "не увійшов до ліміту профілів")],
+      })))
+      .onConflictDoUpdate({
+        target: [searchCandidates.searchId, searchCandidates.creatorId],
+        set: {
+          postIds: sql`excluded.post_ids`, fit: sql`excluded.fit`, readiness: sql`null`, quality: sql`null`, trust: sql`null`, match: sql`null`, lead: sql`false`,
+          score: sql`excluded.score`, stage: sql`excluded.stage`, reasons: sql`excluded.reasons`, source: sql`excluded.source`,
+        },
+      });
+  }
+  if (!shortlist.length) return;
+
+  // 3. Профілі — лише для відібраних і лише тих, кого давно не збирали; у межах бюджету.
+  const freshAfter = new Date(now.getTime() - PROFILE_FRESH_MS);
+  let need = shortlist.filter((s) => !s.c.profileFetchedAt || s.c.profileFetchedAt < freshAfter).map((s) => s.username);
+  const affordable = ctx.budget == null ? need.length : Math.max(0, Math.floor((ctx.budget - ctx.spent) / PRICE.profile + 1e-9));
+  const unpaid = new Set(need.slice(affordable));
+  if (unpaid.size) ctx.notes.push(`Не вистачило бюджету на ${unpaid.size} профілів`);
+  need = need.slice(0, affordable);
+  stats.profilesReused = (stats.profilesReused ?? 0) + shortlist.length - need.length - unpaid.size;
+  stats.profilesFetched ??= 0;
+  const rawProfiles = new Map<string, any>();
+  /** Зібрані в цьому проході (на відміну від узятих із кешу) — лише їх записуємо як свіжі. */
+  const fetched = new Set<string>();
+  for (let i = 0; i < need.length; i += PROFILE_CHUNK) {
+    await setProgress(db, search.id, { stage: "Збираю профілі відібраних авторів", done: i, total: need.length }, stats);
+    const chunk = need.slice(i, i + PROFILE_CHUNK);
+    const { batch } = await collectProfiles(db, chunk);
+    const each = (batch.costUsd ?? chunk.length * PRICE.profile) / chunk.length;
+    for (const u of chunk) charge(ctx, each, ctx.authors.get(u)?.source);
+    const seen = new Set<string>();
+    for (const { item, raw } of batch.collected) {
+      if (item.kind !== "profile" || !item.author?.username) continue;
+      const username = item.author.username.toLowerCase();
+      seen.add(username);
+      rawProfiles.set(username, raw);
+      fetched.add(username);
+      stats.profilesFetched++;
+    }
+    // Профіль не повернувся (видалений, перейменований): позначаємо, щоб не питати щоразу.
+    const missing = chunk.filter((u) => !seen.has(u));
+    if (missing.length) {
+      await db.update(creators).set({ profileFetchedAt: now, updatedAt: now })
+        .where(and(eq(creators.platform, search.platform), inArray(creators.username, missing), sql`${creators.followers} is null`));
+    }
+  }
+  // Сирі профілі з кешу — для тих, кого не збирали зараз.
+  const reuse = shortlist.map((s) => s.username).filter((u) => !rawProfiles.has(u));
+  if (reuse.length) {
+    const rows = await db.select({ ext: contentItems.externalId, raw: contentItems.raw }).from(contentItems)
+      .where(and(eq(contentItems.source, search.platform), inArray(contentItems.externalId, reuse.map((u) => `profile:${u}`))));
+    for (const r of rows) if (r.raw) rawProfiles.set(r.ext.slice("profile:".length), r.raw);
+  }
+  // Сирі дописи з джерел (у них бувають позначка партнерства, відмітки, коментарі).
+  const postIds = shortlist.flatMap((s) => s.postIds);
+  const rawPosts = new Map<number, unknown>();
+  for (let i = 0; i < postIds.length; i += 500) {
+    const rows = await db.select({ id: contentItems.id, raw: contentItems.raw }).from(contentItems).where(inArray(contentItems.id, postIds.slice(i, i + 500)));
+    rows.forEach((r) => rawPosts.set(r.id, r.raw));
+  }
+
+  // 4. Цифри профілю, довіра до аудиторії, реклама — рахує код, безкоштовно.
+  const rows: Row[] = [];
+  for (const s of shortlist) {
+    const raw = rawProfiles.get(s.username);
+    const fromSources = s.postIds.map((id) => postFactsFromRaw(rawPosts.get(id))).filter((p): p is PostFacts => p != null && p.owner === s.username);
+    const posts = mergePosts(raw ? profilePosts(raw) : [], fromSources);
+    const c = raw && fetched.has(s.username) ? await applyProfile(ctx, s.c, raw, posts) : s.c;
+    rows.push({
+      c, source: s.source, fit: s.fit, reasons: [...s.reasons], reject: [], posts,
+      covers: posts.map((p) => p.cover).filter((u): u is string => !!u),
+      videos: posts.filter((p) => p.isVideo && p.videoUrl).map((p) => p.videoUrl!),
+      ads: null, trust: null, comments: posts.flatMap((p) => p.latestComments.map((x) => ({ ...x, postUrl: x.postUrl ?? p.url }))),
+    });
+    if (unpaid.has(s.username) && !raw) rows.at(-1)!.reject.push("профіль не зібрано — не вистачило бюджету");
+  }
+  for (const row of rows) {
+    const c = row.c;
+    const s = scoreCandidate({ ...scoreArgs, texts: textsOf(c.username), bio: c.bio, affiliate: c.affiliate, names: [c.username, c.displayName] });
+    row.fit = s.fit;
+    row.reasons = s.reasons;
+    if (row.reject.length) continue;
+    if (c.followers == null && c.bio == null) await remember(ctx, row, "профіль не знайдено");
+    else if (c.isPrivate) await remember(ctx, row, "закритий профіль");
+    else if (s.negative) await remember(ctx, row, "не окремий автор (магазин, агенція чи платформа)");
+    if (s.blocked) row.reject.push("відсіяно стоп-словом");
+    if (row.reject.length) continue;
+    row.ads = row.posts.length ? analyzeAds(row.posts, c.username, sourcesOf(search).competitors) : (c.ads as AdsReport | null);
+    row.trust = await trustOf(ctx, row, null);
+    row.reject.push(...evaluateCriteria(ctx.criteria, search, factsOf(row, now)).reject);
+  }
+
+  // 5. Аналіз тексту профілю моделлю: хто це насправді, роль, ніші, мова, країна, відповідність брифу.
+  const analyzeRows = rows.filter((r) => r.reject.length === 0);
+  for (const [i, row] of analyzeRows.entries()) {
+    const cached = row.c.analysis as ProfileAnalysis | null;
+    // З брифом аналіз щоразу свій (кеш моделі однаково не дасть заплатити двічі за той самий бриф).
+    const fresh = cached?.version === PROFILE_PROMPT_VERSION && !!row.c.analyzedAt && now.getTime() - row.c.analyzedAt.getTime() < AUDIT_FRESH_MS;
+    let analysis: ProfileAnalysis | null = fresh && !search.brief ? cached : null;
+    if (!analysis && ctx.left.analysis > 0 && !ctx.llmDown) {
+      if (i % 5 === 0) await setProgress(db, search.id, { stage: "Читаю профілі (мовна модель)", done: i, total: analyzeRows.length }, stats);
+      ctx.left.analysis--;
+      const r = await withLlm(ctx, () => analyzeProfile(db, {
+        username: row.c.username, displayName: row.c.displayName, bio: row.c.bio, posts: row.posts.length ? row.posts : textsOf(row.c.username).map((t) => ({ caption: t } as PostFacts)),
+        brief: search.brief, focus: search.focus,
+      }));
+      if (r && !(r instanceof Error)) {
+        analysis = r;
+        const lang = row.c.language ?? r.language;
+        const country = row.c.country ?? r.country?.value ?? null;
+        const [u] = await db.update(creators).set({
+          analysis: r as unknown as Record<string, unknown>, analyzedAt: now, language: lang, country,
+          countryConfidence: row.c.country ? row.c.countryConfidence : r.country ? 0.7 : null, updatedAt: now,
+        }).where(eq(creators.id, row.c.id)).returning();
+        if (u) row.c = u;
+        stats.analyzed = (stats.analyzed ?? 0) + 1;
+      } else if (r instanceof Error) row.reasons.push(`аналіз тексту не вдався: ${r.message.slice(0, 80)}`);
+    }
+    if (!analysis && fresh) analysis = cached;
+    if (!analysis) continue;
+    const v = profileVerdict(analysis, search.focus);
+    if (v.reject) await remember(ctx, row, v.reject);
+    row.fit = Math.max(row.fit, v.fit);
+    row.reasons.push(...v.reasons);
+    // Мову й країну модель могла визначити там, де код не зміг.
+    row.reject = row.reject.concat(evaluateCriteria(ctx.criteria, search, factsOf(row, now)).reject.filter((x) => !row.reject.includes(x)));
+  }
+
+  // 6. Сторінки-візитки та перевірка email (безкоштовно).
+  const alive = rows.filter((r) => r.reject.length === 0);
+  stats.linkPages ??= 0;
+  let done = 0;
+  const linksFreshAfter = new Date(now.getTime() - LINKS_FRESH_MS);
+  await mapLimit(alive, 3, async (row) => {
+    if (!row.c.linksCheckedAt || row.c.linksCheckedAt < linksFreshAfter || row.c.linksCheckedAt < (row.c.profileFetchedAt ?? row.c.linksCheckedAt)) {
+      const r = await enrichCreator(db, row.c);
+      row.c = r.creator;
+      stats.linkPages! += r.pages;
+    }
+    if (++done % 5 === 0 || done === alive.length) {
+      await setProgress(db, search.id, { stage: "Шукаю контакти на сторінках-візитках", done, total: alive.length }, stats);
+    }
+  });
+
+  // 7. Попередній рейтинг: Fit, Readiness, Trust, відповідність «бажаним» критеріям.
+  const contactRows = alive.length ? await db.select().from(creatorContacts).where(inArray(creatorContacts.creatorId, alive.map((r) => r.c.id))) : [];
+  const bestEmailOf = (row: Row) =>
+    contactRows.filter((k) => k.creatorId === row.c.id && row.c.emails.includes(k.email)).sort((a, b) => (EMAIL_RANK[b.status] ?? 0) - (EMAIL_RANK[a.status] ?? 0))[0]?.status ?? null;
+  const readinessOf = (row: Row) => {
+    const days = row.c.lastPostAt ? Math.floor((now.getTime() - row.c.lastPostAt.getTime()) / DAY) : null;
+    return readinessIndex({
+      emailStatus: bestEmailOf(row), daysSincePost: days, hasRate: row.c.rates.length > 0,
+      hasPortfolio: row.c.portfolio.length > 0 || classifyLinks(row.c.links).hubs.length > 0,
+    });
+  };
+  const prelim = (row: Row) => weightedScore(ctx.weights, {
+    fit: row.fit, readiness: readinessOf(row).readiness, trust: row.trust?.score, match: evaluateCriteria(ctx.criteria, search, factsOf(row, now)).match,
+  });
+  alive.sort((a, b) => prelim(b) - prelim(a));
+
+  // 8. Візуальний аудит найкращих; біля порога — друга думка іншої моделі або позначка «перегляньте».
+  const auditFreshAfter = new Date(now.getTime() - AUDIT_FRESH_MS);
+  const toAudit = alive.slice(0, Math.max(0, ctx.left.audits));
+  ctx.left.audits -= toAudit.length;
+  stats.audited ??= 0;
+  for (const [i, row] of toAudit.entries()) {
+    if (row.c.auditedAt && row.c.auditedAt > auditFreshAfter && row.c.quality != null && row.c.auditVersion === AUDIT_VERSION) continue;
+    if (ctx.llmDown) break;
+    await setProgress(db, search.id, { stage: "Оцінюю якість візуалу", done: i, total: toAudit.length }, stats);
+    const res = await withLlm(ctx, () => auditCreator(db, row.c.id, { covers: row.covers, videos: row.videos }, { examples: ctx.examples }));
+    if (res == null) break;
+    if (res instanceof Error) {
+      row.reasons.push(`аудит не вдався: ${res.message.slice(0, 80)}`);
+      continue;
+    }
+    if ("skipped" in res) {
+      row.reasons.push(`аудит пропущено: ${res.skipped}`);
+      continue;
+    }
+    let quality = res.quality;
+    let review: string | null = null;
+    const near = quality != null && [ctx.criteria.quality.min, ctx.criteria.quality.lead].some((t) => Math.abs(quality! - t) <= BORDER);
+    if (near) {
+      const collage = await readFile(collagePath(row.c.id)).catch(() => null);
+      const second = collage ? await secondOpinion(ctx, collage, res.audit.frames, res.audit.fromVideo, res.provider) : null;
+      if (second?.quality != null) {
+        if (Math.abs(second.quality - quality!) > 15) review = `моделі розійшлися: ${quality} і ${second.quality} — перегляньте вручну`;
+        quality = Math.round((quality! + second.quality) / 2);
+      } else review = `оцінка ${quality} біля порога — перегляньте вручну`;
+    }
+    const [u] = await db.update(creators)
+      .set({ quality, audit: res.audit as unknown as Record<string, unknown>, auditedAt: now, auditVersion: AUDIT_VERSION, reviewNote: review })
+      .where(eq(creators.id, row.c.id)).returning();
+    if (u) row.c = u;
+    stats.audited++;
+  }
+
+  // 9. Глибокий аудит роликів (рекламна подача, мовлення) — для найкращих, хто пройшов поріг якості.
+  const deepCandidates = alive.filter((r) => r.c.quality != null && r.c.quality >= ctx.criteria.quality.min && r.videos.length > 0);
+  const toDeep = deepCandidates.slice(0, Math.max(0, ctx.left.deep));
+  ctx.left.deep -= toDeep.length;
+  stats.deepAudited ??= 0;
+  for (const [i, row] of toDeep.entries()) {
+    const prev = row.c.deepAudit as DeepAudit | null;
+    if (prev?.version === DEEP_VERSION && row.c.deepAuditedAt && row.c.deepAuditedAt > auditFreshAfter && !search.brief) continue;
+    if (ctx.llmDown) break;
+    await setProgress(db, search.id, { stage: "Розбираю ролики й мовлення", done: i, total: toDeep.length }, stats);
+    const adUrls = new Set(row.ads?.examples.map((e) => e.url) ?? []);
+    const res = await withLlm(ctx, () => deepAudit(db, row.c.id, { posts: row.posts, adUrls, brief: search.brief }));
+    if (res == null) break;
+    if (res instanceof Error) {
+      row.reasons.push(`розбір роликів не вдався: ${res.message.slice(0, 80)}`);
+      continue;
+    }
+    if ("skipped" in res) continue;
+    const lang = res.transcript?.language ?? null;
+    const [u] = await db.update(creators)
+      .set({ deepAudit: res as unknown as Record<string, unknown>, adQuality: adQualityIndex(res), deepAuditedAt: now, ...(lang ? { language: lang } : {}) })
+      .where(eq(creators.id, row.c.id)).returning();
+    if (u) row.c = u;
+    stats.deepAudited++;
+  }
+
+  // 10. Реакція аудиторії: платна вибірка коментарів (за галочкою) + безкоштовні коментарі з дописів джерел.
+  const toComments = alive.filter((r) => r.c.quality == null || r.c.quality >= ctx.criteria.quality.min).slice(0, Math.max(0, ctx.left.comments));
+  ctx.left.comments -= toComments.length;
+  stats.commentsAnalyzed ??= 0;
+  for (const [i, row] of toComments.entries()) {
+    if (row.c.commentsAt && now.getTime() - row.c.commentsAt.getTime() < COMMENTS_FRESH_MS) continue;
+    const est = COMMENT_POSTS * COMMENTS_PER_POST * PRICE.comment;
+    if (!canSpend(ctx, est)) {
+      ctx.notes.push("Розбір коментарів зупинено: не вистачає бюджету");
+      break;
+    }
+    await setProgress(db, search.id, { stage: "Читаю коментарі", done: i, total: toComments.length }, stats);
+    const adUrls = new Set(row.ads?.examples.map((e) => e.url) ?? []);
+    const picked = [...row.posts.filter((p) => adUrls.has(p.url)).slice(0, 1), ...row.posts.filter((p) => !adUrls.has(p.url) && !p.pinned)]
+      .filter((p) => (p.comments ?? 1) > 0).slice(0, COMMENT_POSTS);
+    if (!picked.length) continue;
+    try {
+      const r = await collect(db, { type: "instagram-comments", postUrls: picked.map((p) => p.url), perPost: COMMENTS_PER_POST });
+      charge(ctx, r.costUsd, row.source);
+      const shortOf = (u?: string) => u?.match(/\/(?:p|reel|tv)\/([A-Za-z0-9_-]+)/)?.[1];
+      const urlByShort = new Map(picked.map((p) => [p.shortCode, p.url]));
+      for (const item of r.items) {
+        const postUrl = urlByShort.get(item.thread?.rootId ?? "") ?? item.url;
+        row.comments.push({ text: item.text ?? "", owner: item.author?.username?.toLowerCase(), postUrl });
+      }
+      const seen = new Set<string>();
+      row.comments = row.comments.filter((c) => {
+        const k = `${shortOf(c.postUrl)}|${c.owner}|${c.text}`;
+        return c.text && !seen.has(k) && (seen.add(k), true);
+      });
+    } catch (e) {
+      row.reasons.push(`коментарі не зібрано: ${(e instanceof Error ? e.message : String(e)).slice(0, 80)}`);
+    }
+    await saveComments(ctx, row, adUrls);
+  }
+  // Автори без платної вибірки, але з безкоштовними коментарями з дописів — лише цифри, без моделі.
+  for (const row of alive) {
+    if (toComments.includes(row) || row.comments.length < 15 || row.c.commentsReport) continue;
+    const m = commentMetrics(row.comments, row.c.username, row.c.language);
+    const [u] = await db.update(creators).set({ commentsReport: { metrics: m, free: true } as unknown as Record<string, unknown> }).where(eq(creators.id, row.c.id)).returning();
+    if (u) row.c = u;
+  }
+
+  // 11. Підсумок: довіра з урахуванням коментарів, критерії, пороги якості, «готові ліди».
+  const finalRows = [];
+  for (const row of rows) {
+    if (row.reject.length) {
+      finalRows.push({
+        row, stage: "rejected" as const, readiness: null, quality: null, trust: row.trust?.score ?? null, match: null,
+        reasons: [...row.reasons, ...trustReasons(row.trust), ...row.reject], lead: false,
+      });
+      continue;
+    }
+    const report = row.c.commentsReport as { metrics?: ReturnType<typeof commentMetrics>; analysis?: { botLike?: { value: string } } } | null;
+    row.trust = await trustOf(ctx, row, report?.metrics ? { ...report.metrics, botLike: report.analysis?.botLike?.value === "yes" } : null);
+    const audit = row.c.audit as Partial<VisionAudit> & { minor_is_main_subject?: boolean; brand_safety_flags?: string[] } | null;
+    const quality = row.c.quality;
+    const facts = factsOf(row, now, bestEmailOf(row));
+    const crit = evaluateCriteria(ctx.criteria, search, facts);
+    const reject = [...crit.reject];
+    if (audit?.minor || audit?.minor_is_main_subject) reject.push("головні герої контенту — діти");
+    const flags = audit?.flags ?? audit?.brand_safety_flags ?? [];
+    if (flags.length) reject.push(`небезпечно для бренду: ${flags.join(", ")}`);
+    if (quality != null && quality < ctx.criteria.quality.min) reject.push(`низька якість зйомки (${Math.round(quality)})`);
+    const r = readinessOf(row);
+    const ok = reject.length === 0;
+    const reasons = [...row.reasons, ...r.reasons, ...(row.ads ? adsReasons(row.ads) : [])];
+    reasons.push(...trustReasons(row.trust));
+    if (row.c.adQuality != null) reasons.push(`рекламна подача ${Math.round(row.c.adQuality)}/100`);
+    if (crit.preferredMet.length) reasons.push(`бажане виконано: ${crit.preferredMet.join(", ")}`);
+    reasons.push(...crit.notes);
+    if (row.c.reviewNote) reasons.push(row.c.reviewNote);
+    const emailOk = ctx.criteria.email === "off" || facts.hasEmail === true;
+    const lead = ok && activityStatus(row.c.lastPostAt, now) === "active" && emailOk && quality != null && quality >= ctx.criteria.quality.lead && row.trust?.risk !== "high";
+    if (ok) ctx.qualified.add(row.c.username);
+    finalRows.push({ row, stage: ok ? ("qualified" as const) : ("rejected" as const), readiness: r.readiness, quality, trust: row.trust?.score ?? null, match: crit.match, reasons: [...reasons, ...reject], lead });
+  }
+  for (const f of finalRows) {
+    const score = weightedScore(ctx.weights, { fit: f.row.fit, readiness: f.readiness, quality: f.quality, trust: f.trust, match: f.match });
+    await db.update(searchCandidates)
+      .set({ stage: f.stage, fit: f.row.fit, readiness: f.readiness, quality: f.quality, trust: f.trust, match: f.match, score, reasons: f.reasons, lead: f.lead })
+      .where(and(eq(searchCandidates.searchId, search.id), eq(searchCandidates.creatorId, f.row.c.id)));
+    if (f.stage === "qualified") sourceStats(ctx, f.row.source).qualified++;
+    if (f.lead) sourceStats(ctx, f.row.source).leads++;
+  }
+  stats.qualified = (stats.qualified ?? 0) + finalRows.filter((f) => f.stage === "qualified").length;
+  stats.leads = (stats.leads ?? 0) + finalRows.filter((f) => f.lead).length;
+  stats.withEmail = (stats.withEmail ?? 0) + alive.filter((r) => r.c.emails.length > 0).length;
+  stats.review = (stats.review ?? 0) + finalRows.filter((f) => f.stage === "qualified" && f.row.c.reviewNote).length;
+}
+
+const trustReasons = (t: TrustReport | null) =>
+  t && t.risk !== "unknown" ? [...t.signals.filter((s) => s.level !== "info").map((s) => `мінус: ${s.text}`), ...(t.risk === "low" ? ["ризик накрутки: низький"] : [])] : [];
+
+/** Записує профіль: поля, цифри дописів, знімок для історії. */
+async function applyProfile(ctx: Ctx, c: Creator, raw: any, posts: PostFacts[]): Promise<Creator> {
+  const { db, now } = ctx;
+  const followers = typeof raw.followersCount === "number" && raw.followersCount >= 0 ? Math.round(raw.followersCount) : null;
+  const m = postMetrics(posts, followers);
+  const act = activityOf(posts.map((p) => ({ publishedAt: p.publishedAt ?? undefined, metrics: { views: p.views ?? undefined } })), followers, now);
+  const links = [raw.externalUrl, ...(Array.isArray(raw.externalUrls) ? raw.externalUrls.map((l: any) => l?.url) : [])]
+    .filter((l, i, a): l is string => typeof l === "string" && /^https?:\/\//.test(l) && a.indexOf(l) === i);
+  const bio = typeof raw.biography === "string" && raw.biography ? raw.biography : null;
+  const geo = detectCountry({ bio, links });
+  const lang = detectLanguage([bio ?? "", ...posts.map((p) => p.caption)].join("\n"));
+  const follows = typeof raw.followsCount === "number" && raw.followsCount >= 0 ? Math.round(raw.followsCount) : null;
+  const [u] = await db.update(creators)
+    .set({
+      displayName: raw.fullName || null, bio, externalId: raw.id ? String(raw.id) : null, followers, follows,
+      postsCount: typeof raw.postsCount === "number" ? raw.postsCount : null, links,
+      avatarUrl: [raw.profilePicUrlHD, raw.profilePicUrl].find((x) => typeof x === "string" && /^https?:\/\//.test(x)) ?? null,
+      verified: typeof raw.verified === "boolean" ? raw.verified : null,
+      isPrivate: typeof raw.private === "boolean" ? raw.private : null,
+      isBusiness: typeof raw.isBusinessAccount === "boolean" ? raw.isBusinessAccount : null,
+      businessCategory: typeof raw.businessCategoryName === "string" ? raw.businessCategoryName : null,
+      lastPostAt: act.lastPostAt, medianViews: act.medianViews, erViews: act.erViews, erLikes: m.erLikes,
+      metrics: m as unknown as Record<string, unknown>,
+      country: geo.country, countryConfidence: geo.country ? geo.confidence : null, language: lang.language,
+      profileFetchedAt: now, updatedAt: now,
+    })
+    .where(eq(creators.id, c.id)).returning();
+  await db.insert(creatorSnapshots).values({ creatorId: c.id, followers, follows, postsCount: typeof raw.postsCount === "number" ? raw.postsCount : null, erLikes: m.erLikes });
+  return u ?? c;
+}
+
+/** Пам’ять відмов: причина зберігається в автора, і наступні пошуки не платять за його профіль. */
+async function remember(ctx: Ctx, row: Row, reason: string) {
+  row.reject.push(reason);
+  await ctx.db.update(creators).set({ hardReject: reason, hardRejectAt: ctx.now }).where(eq(creators.id, row.c.id));
+}
+
+function factsOf(row: Row, now: Date, bestEmail?: string | null): CreatorFacts {
+  const c = row.c;
+  const deep = c.deepAudit as DeepAudit | null;
+  return {
+    followers: c.followers, country: c.country, language: c.language,
+    daysSincePost: c.lastPostAt ? Math.floor((now.getTime() - c.lastPostAt.getTime()) / DAY) : null,
+    erLikes: c.erLikes,
+    hasEmail: bestEmail === undefined ? null : bestEmail === "personal" || bestEmail === "business",
+    adPosts: row.ads ? row.ads.adPosts : null, postsSeen: row.ads?.posts ?? row.posts.length,
+    trustRisk: row.trust?.risk ?? null,
+    formats: deep?.formats ?? null,
+  };
+}
+
+async function trustOf(ctx: Ctx, row: Row, comments: Parameters<typeof assessTrust>[0]["comments"]): Promise<TrustReport> {
+  const snaps = await ctx.db.select().from(creatorSnapshots)
+    .where(and(eq(creatorSnapshots.creatorId, row.c.id), gte(creatorSnapshots.at, new Date(ctx.now.getTime() - 120 * DAY))));
+  const metrics = row.posts.length ? postMetrics(row.posts, row.c.followers) : (row.c.metrics as unknown as ReturnType<typeof postMetrics> | null);
+  const report = assessTrust({
+    followers: row.c.followers, follows: row.c.follows,
+    metrics: metrics ?? postMetrics([], row.c.followers),
+    norms: ctx.norms, snapshots: snaps.map((s): Snapshot => ({ at: s.at, followers: s.followers, erLikes: s.erLikes })), comments, now: ctx.now,
+  });
+  const [u] = await ctx.db.update(creators)
+    .set({ trust: report as unknown as Record<string, unknown>, trustRisk: report.risk, ads: (row.ads ?? row.c.ads) as Record<string, unknown> | null })
+    .where(eq(creators.id, row.c.id)).returning();
+  if (u) row.c = u;
+  return report;
+}
+
+async function secondOpinion(ctx: Ctx, collage: Buffer, frames: number, fromVideo: number, firstProvider: string) {
+  try {
+    return await scoreCollage(ctx.db, collage, frames, { fromVideo, examples: ctx.examples, exclude: [firstProvider] });
+  } catch {
+    return null; // іншої моделі немає або вона недоступна — тоді позначка «перегляньте вручну»
+  }
+}
+
+async function saveComments(ctx: Ctx, row: Row, adUrls: Set<string>) {
+  if (row.comments.length < 5) return;
+  const metrics = commentMetrics(row.comments, row.c.username, row.c.language);
+  const analysis = await withLlm(ctx, () => analyzeComments(ctx.db, row.comments.map((c) => ({ ...c, ad: !!c.postUrl && adUrls.has(c.postUrl) })), row.c.username));
+  const report = { metrics, analysis: analysis && !(analysis instanceof Error) ? analysis : null, free: false };
+  const [u] = await ctx.db.update(creators)
+    .set({ commentsReport: report as unknown as Record<string, unknown>, commentsAt: ctx.now }).where(eq(creators.id, row.c.id)).returning();
+  if (u) row.c = u;
+  ctx.stats.commentsAnalyzed = (ctx.stats.commentsAnalyzed ?? 0) + 1;
+  if (report.analysis?.purchaseIntent.value === "yes") row.reasons.push("у коментарях питають, де купити");
+  if (report.analysis?.trustsCreator.value === "yes") row.reasons.push("аудиторія купує за порадою автора");
+}
+
 /** Бере наступний пошук із черги й виконує його. Повертає false, якщо черга порожня. */
 export async function runNextSearch(db: Db): Promise<boolean> {
+  await scheduleRepeats(db);
   const [next] = await db
     .update(searches)
     .set({ status: "running", startedAt: new Date(), error: null })
@@ -398,6 +766,25 @@ export async function runNextSearch(db: Db): Promise<boolean> {
   if (!next) return false;
   await runSearch(db, next.id);
   return true;
+}
+
+/**
+ * Повтор за розкладом: коли минуло repeatDays від завершення останнього запуску серії, створюється
+ * новий пошук з тими самими налаштуваннями — він покаже лише авторів, яких серія ще не бачила.
+ */
+export async function scheduleRepeats(db: Db, now = new Date()): Promise<number> {
+  const rows = await db.select().from(searches).where(and(isNotNull(searches.repeatDays), eq(searches.status, "done")));
+  let created = 0;
+  for (const s of rows) {
+    const root = s.parentId ?? s.id;
+    const [later] = await db.select({ id: searches.id }).from(searches)
+      .where(and(eq(searches.parentId, root), sql`${searches.id} > ${s.id}`)).limit(1);
+    if (later || !s.finishedAt || now.getTime() - s.finishedAt.getTime() < s.repeatDays! * DAY) continue;
+    const { id: _id, createdAt: _c, startedAt: _s, finishedAt: _f, status: _st, progress: _p, stats: _x, error: _e, ...config } = s;
+    await db.insert(searches).values({ ...config, parentId: root, name: `${s.name.replace(/ · повтор.*$/, "")} · повтор ${new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit" }).format(now)}` });
+    created++;
+  }
+  return created;
 }
 
 /** Після перезапуску сервера перервані пошуки повертаються в чергу: зібране вже в кеші. */
