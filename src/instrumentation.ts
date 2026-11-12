@@ -1,6 +1,9 @@
 /** Виконується один раз під час старту сервера. */
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs" || !process.env.DATABASE_URL) return;
+  // Забута обробка помилки десь у фоні (обрив з’єднання з базою тощо) не повинна вбивати весь дашборд:
+  // записуємо її в журнал і працюємо далі.
+  process.on("unhandledRejection", (e) => console.error("Необроблена помилка у фоні:", e));
   try {
     const [{ getDb }, { failInterruptedRuns }, search, scrape] = await Promise.all([
       import("@/db/client"), import("@/collect"), import("@/search/pipeline"), import("@/scrape/jobs"),

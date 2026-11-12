@@ -90,7 +90,7 @@ function stopServer() {
   const pid = Number(readFileSync(pidFile, "utf8"));
   try {
     if (win) spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"]);
-    else process.kill(-pid, "SIGTERM"); // уся група: npm і сам next
+    else process.kill(-pid, "SIGTERM"); // уся група: сторож і сам next
   } catch {}
   rmSync(pidFile, { force: true });
 }
@@ -125,24 +125,25 @@ if (!state || stale) {
     stopServer();
     for (let i = 0; i < 20 && (await health()); i++) await sleep(500);
   }
-  if (!existsSync(path.join(root, "node_modules")) || stale) await run(["install"], "", netRetry);
-  await run(["run", "db:migrate"], "\nНайчастіша причина — база даних недоступна. Перевірте інтернет і чи не призупинено проєкт Supabase;\nзмінити рядок підключення — «npm run setup».", netRetry);
-  if (stale) {
+  // Залежності, міграції й збірка потрібні лише після оновлення коду. Звичайне ввімкнення ПК
+  // їх пропускає, тож сервер піднімається за секунди й не чекає на інтернет.
+  if (stale || !existsSync(path.join(root, "node_modules"))) {
+    await run(["install"], "", netRetry);
+    await run(["run", "db:migrate"], "\nНайчастіша причина — база даних недоступна. Перевірте інтернет і чи не призупинено проєкт Supabase;\nзмінити рядок підключення — «npm run setup».", netRetry);
     await run(["run", "build"]);
     writeFileSync(builtFile, version);
   }
 
-  const log = openSync(logFile, "w"); // новий запуск — новий журнал, файл не росте безмежно
-  const child = spawn("npm", ["start"], {
-    cwd: root, detached: true, stdio: ["ignore", log, log], shell: win, windowsHide: true,
-    env: { ...process.env, PORT: port },
+  // Сервер працює під наглядом сторожа (scripts/supervise.mjs): упав чи завис — підніметься сам.
+  const child = spawn(process.execPath, [path.join(root, "scripts", "supervise.mjs")], {
+    cwd: root, detached: true, stdio: "ignore", windowsHide: true, env: { ...process.env, PORT: port },
   });
   writeFileSync(pidFile, String(child.pid));
   child.unref();
 
   state = null;
-  for (let i = 0; i < 60 && !(state = await health()); i++) await sleep(1000);
-  if (!state) fail(`Сервер не відповів за хвилину. Останні рядки data/server.log:\n${logTail()}`);
+  for (let i = 0; i < 90 && !(state = await health()); i++) await sleep(1000);
+  if (!state) fail(`Сервер не відповів за півтори хвилини. Останні рядки data/server.log:\n${logTail()}`);
 }
 // База може прокинутися не одразу (Supabase після простою, мережа після ввімкнення ПК).
 for (let i = 0; !state.ok && i < (background ? 20 : 2); i++) {
