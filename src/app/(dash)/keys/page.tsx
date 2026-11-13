@@ -1,3 +1,4 @@
+import { listBackups } from "@/backup";
 import { asc, eq, gte, sql } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { apiKeys, providers, usageEvents, type ApiKey, type Provider } from "@/db/schema";
@@ -5,7 +6,7 @@ import { SECRET_HINTS } from "@/keys/presets";
 import { canSync } from "@/keys/quota-sync";
 import { availableAt, effectiveUsed, keyState, nextPeriodStart, type KeyState } from "@/keys/router";
 import { canDecrypt } from "@/keys/crypto";
-import { addKey, addProvider, deleteKey, deleteProvider, resetUsage, setProviderModel, syncKey, toggleKey } from "./actions";
+import { addKey, addProvider, backupNow, deleteKey, deleteProvider, resetUsage, setProviderModel, syncKey, toggleKey } from "./actions";
 import { ConfirmButton } from "./confirm-button";
 
 const UNIT: Record<string, string> = { requests: "запитів", credits: "кредитів", tokens: "токенів", usd: "$" };
@@ -138,7 +139,7 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
   const now = new Date();
   const weekAgo = new Date(now.getTime() - 7 * 86400_000);
 
-  const [allProviders, keyRows, usage] = await Promise.all([
+  const [allProviders, keyRows, usage, backups] = await Promise.all([
     db.select().from(providers).orderBy(asc(providers.kind), asc(providers.name)),
     db.select({ key: apiKeys, provider: providers }).from(apiKeys)
       .innerJoin(providers, eq(apiKeys.providerId, providers.id))
@@ -155,6 +156,7 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
       .where(gte(usageEvents.at, weekAgo))
       .groupBy(providers.name)
       .orderBy(asc(providers.name)),
+    listBackups(),
   ]);
 
   const broken = keyRows.filter((r) => !canDecrypt(r.key.secretEnc)).length;
@@ -272,6 +274,19 @@ export default async function KeysPage({ searchParams }: { searchParams: Promise
             </tbody>
           </table></div>
         )}
+      </section>
+
+      <section className="card" id="backup">
+        <h2>Резервні копії бази</h2>
+        <p className="muted">
+          Щодня сервер зберігає копію бази в теці <span className="mono">data\backups</span> на цьому комп’ютері (останні 14).
+          Ключі сервісів у копії зашифровані — бережіть разом із нею файл <span className="mono">.env</span>.
+          Відновити в нову порожню базу: <span className="mono">npm run db:migrate</span>, потім <span className="mono">npm run restore -- data/backups/файл.jsonl.gz</span>.
+        </p>
+        {backups.length === 0 ? <p className="muted">Копій ще немає — перша з’явиться протягом години після запуску сервера.</p> : (
+          <ul className="plain">{backups.slice(0, 5).map((b) => <li key={b.name}>{b.name} · {(b.bytes / 1024 / 1024).toFixed(1)} МБ · {df.format(b.at)}</li>)}</ul>
+        )}
+        <form action={backupNow}><button>Зробити копію зараз</button></form>
       </section>
     </>
   );

@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, lte, sql } from "drizzle-orm";
 import { profilePosts, type PostFacts } from "@/analysis/posts";
 import type { Db } from "@/db/client";
 import {
@@ -6,9 +6,11 @@ import {
   type ClientPolicy, type Mailbox, type OutreachMessage, type OutreachStatus, type OutreachThread, type PostCheck, type ThreadStatus,
 } from "@/db/schema";
 import { collect } from "@/collect";
+import { fetchTikTokProfiles } from "@/collect/tiktok";
 import { detectLanguage } from "@/enrich/geo";
 import { LlmUnavailableError } from "@/llm/client";
 import { emailKey, suppressedSet, usernameKey } from "@/search/suppress";
+import { guardMailbox, mailboxHealth, pickMailbox, verifiedVerdict } from "./deliver";
 import { firstName, generateDraft, SENDER } from "./draft";
 import { newMessageId, normEmail, stripQuoted, transportFor, type InMail } from "./mail";
 import {
@@ -79,7 +81,7 @@ export type StartResult = { id: number | null; created: boolean; error?: string 
 export async function startThread(db: Db, input: { creatorId: number; clientId: number; searchId?: number | null; toEmail?: string | null }): Promise<StartResult> {
   const [client] = await db.select().from(clients).where(eq(clients.id, input.clientId));
   if (!client) return { id: null, created: false, error: "Клієнта не знайдено" };
-  if (!client.mailboxId) return { id: null, created: false, error: "У клієнта не вибрано поштову скриньку" };
+  if (!client.mailboxId && !client.mailboxPool.length) return { id: null, created: false, error: "У клієнта не вибрано поштову скриньку" };
   const [c] = await db.select().from(creators).where(eq(creators.id, input.creatorId));
   if (!c) return { id: null, created: false, error: "Автора не знайдено" };
   const email = input.toEmail?.trim() || (await bestEmail(db, c.id, c.emails));
@@ -87,8 +89,11 @@ export async function startThread(db: Db, input: { creatorId: number; clientId: 
   const blocked = await suppressedSet(db, [usernameKey(c.platform, c.username), emailKey(email)]);
   if (blocked.size) return { id: null, created: false, error: "Автор у списку виключень" };
   const [s] = input.searchId ? await db.select().from(searches).where(eq(searches.id, input.searchId)) : [];
+  // Ротація: нове листування бере скриньку клієнта з найбільшим вільним лімітом на сьогодні.
+  const mailboxId = await pickMailbox(db, [...(client.mailboxId ? [client.mailboxId] : []), ...client.mailboxPool]);
+  if (!mailboxId) return { id: null, created: false, error: "Усі скриньки клієнта зупинені — перевірте їх на сторінці «Клієнти»" };
   const [row] = await db.insert(outreachThreads).values({
-    creatorId: c.id, clientId: client.id, searchId: s?.id ?? null, mailboxId: client.mailboxId, toEmail: normEmail(email),
+    creatorId: c.id, clientId: client.id, searchId: s?.id ?? null, mailboxId, toEmail: normEmail(email),
     subject: "", language: s?.outreachLanguage ?? (c.language && LANGS.has(c.language) ? c.language : "en"), status: "draft", nextActionAt: new Date(),
   }).onConflictDoNothing().returning({ id: outreachThreads.id });
   if (row) return { id: row.id, created: true };
@@ -166,12 +171,6 @@ async function queueFollowup(db: Db, t: OutreachThread): Promise<void> {
 
 /* ---------- надсилання ---------- */
 
-async function sentToday(db: Db, mailboxId: number): Promise<number> {
-  const [r] = await db.select({ n: sql<number>`count(*)::int` }).from(outreachMessages)
-    .where(and(eq(outreachMessages.mailboxId, mailboxId), eq(outreachMessages.status, "sent"), gte(outreachMessages.sentAt, new Date(Date.now() - DAY))));
-  return r?.n ?? 0;
-}
-
 export function signature(body: string, policy: ClientPolicy, mb: Mailbox | undefined): string {
   return body.replaceAll(SENDER, policy.senderName || mb?.fromName || "").trimEnd();
 }
@@ -183,6 +182,13 @@ async function sendMessage(db: Db, m: OutreachMessage, t: OutreachThread, mb: Ma
     if (blocked.size) {
       await db.update(outreachMessages).set({ status: "discarded", error: "автор у списку виключень" }).where(eq(outreachMessages.id, m.id));
       await updateThread(db, t, { status: "closed" });
+      return;
+    }
+    // Адреса, якої не існує, поверне лист — а кожне повернення псує репутацію скриньки.
+    const v = await verifiedVerdict(db, t.creatorId, t.toEmail);
+    if (v?.verdict === "invalid") {
+      await db.update(outreachMessages).set({ status: "discarded", error: `адреса не існує (${v.service})` }).where(eq(outreachMessages.id, m.id));
+      await updateThread(db, t, { needsHuman: `Адреса ${t.toEmail} не існує (перевірка ${v.service}) — знайдіть іншу або закрийте листування`, nextActionAt: null });
       return;
     }
   }
@@ -199,6 +205,7 @@ async function sendMessage(db: Db, m: OutreachMessage, t: OutreachThread, mb: Ma
     const err = (e instanceof Error ? e.message : String(e)).slice(0, 500);
     await db.update(outreachMessages).set({ status: "failed", error: err, mailboxId: mb.id }).where(eq(outreachMessages.id, m.id));
     await updateThread(db, t, { needsHuman: `Не вдалося надіслати лист: ${err}` });
+    await guardMailbox(db, mb);
     return;
   }
   const now = new Date();
@@ -223,7 +230,10 @@ async function sendNext(db: Db): Promise<boolean> {
     const last = state.lastSend.get(t.mailboxId) ?? 0;
     if (Date.now() - last < SEND_GAP_MS) continue;
     const [mb] = await db.select().from(mailboxes).where(eq(mailboxes.id, t.mailboxId));
-    if (!mb || (await sentToday(db, mb.id)) >= mb.dailyLimit) continue;
+    if (!mb || mb.pausedAt) continue;
+    if (await guardMailbox(db, mb)) continue;
+    const h = await mailboxHealth(db, mb);
+    if (h.sent24h >= h.limit) continue;
     const { policy } = await loadThread(db, t.id);
     state.lastSend.set(mb.id, Date.now());
     await sendMessage(db, m, t, mb, policy);
@@ -277,6 +287,8 @@ async function pollMailbox(db: Db, mb: Mailbox): Promise<number> {
     let n = 0;
     for (const mail of r.mails) if (await ingestMail(db, mb, mail)) n++;
     await db.update(mailboxes).set({ lastUid: r.lastUid, uidValidity: r.uidValidity, lastPolledAt: new Date(), lastError: null }).where(eq(mailboxes.id, mb.id));
+    // Прийшли повернення — одразу перевіряємо, чи не пора зупинити скриньку.
+    if (r.mails.some((m) => m.bounce)) await guardMailbox(db, mb);
     return n;
   } catch (e) {
     await db.update(mailboxes).set({ lastPolledAt: new Date(), lastError: (e instanceof Error ? e.message : String(e)).slice(0, 500) }).where(eq(mailboxes.id, mb.id));
@@ -386,6 +398,7 @@ export async function checkPost(db: Db, threadId: number): Promise<PostCheck> {
   const { t, policy, creator } = await loadThread(db, threadId);
   if (!creator) throw new Error("Автора не знайдено");
   const now = new Date();
+  if (creator.platform === "tiktok") return checkTikTokPost(db, t, creator.username, creator.postsCount, now);
   if (policy.mustTag.length === 0) {
     await updateThread(db, t, { needsHuman: "Не задано @бренд чи #хештег у правилах клієнта — допис не перевірити автоматично", nextActionAt: null });
     return { checkedAt: now.toISOString(), found: false, note: "немає позначок для перевірки" };
@@ -417,6 +430,31 @@ export async function checkPost(db: Db, threadId: number): Promise<PostCheck> {
       await queueReply(db, t, { kind: "remind_post", feeUsd: null, barter: false, askRate: false, askAddress: false, answers: [] }, policy, { name: firstName(creator.displayName), handle: `@${creator.username}` }, "", t.language, "строк публікації минув");
       check.note += "; нагадано";
     } else if (prev?.note?.includes("нагадано")) check.note += "; нагадано";
+    await updateThread(db, t, { postCheck: check, nextActionAt: new Date(now.getTime() + DAY) });
+  }
+  return check;
+}
+
+/**
+ * TikTok: ролики безкоштовно не читаються, але публічний профіль показує кількість роликів.
+ * Якщо після відправки товару їх стало більше — кличемо людину глянути й зарахувати допис посиланням.
+ */
+async function checkTikTokPost(db: Db, t: OutreachThread, username: string, videosBefore: number | null, now: Date): Promise<PostCheck> {
+  const before = t.postCheck?.videos ?? videosBefore;
+  const b = await fetchTikTokProfiles([username]);
+  const raw = b.collected[0]?.raw as { postsCount?: number | null } | undefined;
+  const videos = raw?.postsCount ?? null;
+  const check: PostCheck = { checkedAt: now.toISOString(), found: false, videos: before ?? videos ?? undefined, note: "" };
+  const due = t.postDueAt ?? new Date(now.getTime() + DAY);
+  if (videos != null && before != null && videos > before) {
+    check.note = `з’явилось нових роликів: ${videos - before}`;
+    await updateThread(db, t, { postCheck: check, nextActionAt: null, needsHuman: `У автора @${username} ${check.note} після відправки — відкрийте профіль і зарахуйте допис посиланням` });
+    return check;
+  }
+  check.note = videos == null ? "профіль TikTok не відкрився" : "нових роликів немає";
+  if (now.getTime() > due.getTime() + 7 * DAY) {
+    await updateThread(db, t, { postCheck: check, nextActionAt: null, needsHuman: "Допис у TikTok не вийшов через тиждень після строку — потрібне ваше рішення" });
+  } else {
     await updateThread(db, t, { postCheck: check, nextActionAt: new Date(now.getTime() + DAY) });
   }
   return check;
@@ -491,9 +529,17 @@ export async function manualReply(db: Db, threadId: number, body: string): Promi
 }
 
 export async function markShipped(db: Db, threadId: number): Promise<void> {
-  const { t, policy } = await loadThread(db, threadId);
+  const { t, policy, creator } = await loadThread(db, threadId);
   const now = Date.now();
+  // TikTok: запам’ятовуємо, скільки роликів було на момент відправки, — нові ролики потім покличуть людину.
+  let postCheck = t.postCheck;
+  if (creator?.platform === "tiktok") {
+    const b = await fetchTikTokProfiles([creator.username]).catch(() => null);
+    const videos = (b?.collected[0]?.raw as { postsCount?: number | null } | undefined)?.postsCount;
+    if (videos != null) postCheck = { checkedAt: new Date(now).toISOString(), found: false, videos, note: "роликів на момент відправки" };
+  }
   await updateThread(db, t, {
+    postCheck,
     status: "shipped", shippedAt: new Date(now), needsHuman: null,
     postDueAt: new Date(now + (DELIVERY_DAYS + policy.deadlineDays) * DAY),
     nextActionAt: new Date(now + 3 * DAY),

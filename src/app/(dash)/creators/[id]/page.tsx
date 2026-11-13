@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { profileLabel, profileUrl } from "@/lib/profile-url";
 import { notFound } from "next/navigation";
 import { desc, eq } from "drizzle-orm";
 import type { AdsReport } from "@/analysis/ads";
@@ -73,7 +74,7 @@ export default async function CreatorCard({ params, searchParams }: {
       </p>
       <h1>@{c.username} {c.displayName ? <span className="muted" style={{ fontSize: 16, fontWeight: 400 }}>{c.displayName}</span> : null}</h1>
       <p className="sub">
-        <a href={`https://www.instagram.com/${c.username}/`} target="_blank" rel="noreferrer">instagram.com/{c.username}</a>
+        <a href={profileUrl(c.platform, c.username)} target="_blank" rel="noreferrer">{profileLabel(c.platform, c.username)}</a>
         {c.businessCategory ? ` · ${c.businessCategory}` : ""}{c.country ? ` · країна ${c.country}` : ""}{c.language ? ` · мова ${c.language}` : ""}
         {c.profileFetchedAt ? ` · дані на ${df.format(c.profileFetchedAt)}` : ""}
       </p>

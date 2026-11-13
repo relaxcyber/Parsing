@@ -18,7 +18,7 @@ const split = (v: unknown) => String(v ?? "").split(/[,\n]/).map((s) => s.trim()
 const tags = (max: number) => z.unknown().transform((v) => [...new Set(split(v).map((s) => s.replace(/^#/, "").toLowerCase()))].slice(0, max));
 const lines = (max: number) => z.unknown().transform((v) => [...new Set(split(v))].slice(0, max));
 const handles = (max: number) => z.unknown().transform((v) =>
-  [...new Set(split(v).map((s) => s.replace(/^@/, "").replace(/^https?:\/\/(www\.)?instagram\.com\//, "").replace(/\/.*$/, "").toLowerCase()).filter((s) => /^[a-z0-9._]{2,30}$/.test(s)))].slice(0, max));
+  [...new Set(split(v).map((s) => s.replace(/^@/, "").replace(/^https?:\/\/(www\.|m\.)?(instagram\.com\/|tiktok\.com\/@)/i, "").replace(/[/?#].*$/, "").toLowerCase()).filter((s) => /^[a-z0-9._]{2,30}$/.test(s)))].slice(0, max));
 const optionalInt = z.preprocess((v) => (v === "" || v == null ? null : v), z.coerce.number().int().nonnegative().nullable());
 const optionalNum = z.preprocess((v) => (v === "" || v == null ? null : String(v).replace(",", ".")), z.coerce.number().nonnegative().nullable());
 const text = (max: number) => z.preprocess((v) => (v == null ? "" : String(v).trim()), z.string().max(max)).transform((v) => v || null);
@@ -28,6 +28,7 @@ const weight = z.coerce.number().min(0).max(3).catch(1);
 const SearchForm = z.object({
   name: z.string().trim().min(2).max(80),
   focus: z.enum(["ugc", "affiliate"]),
+  platform: z.enum(["instagram", "tiktok"]).catch("instagram"),
   brief: text(4000), brandName: text(80), offer: text(1000), letterExample: text(3000),
   outreachLanguage: z.enum(["en", "uk", "ru", "pl", "de", "es"]),
   hashtags: tags(10), keywords: tags(20), stopWords: tags(30),
@@ -58,13 +59,14 @@ export async function createSearch(form: FormData) {
   const parsed = SearchForm.safeParse(Object.fromEntries(form));
   const d = parsed.data;
   const sources = d && { bioQueries: d.bioQueries, competitors: d.competitors, seeds: d.seeds, places: d.places, webQueries: d.webQueries, usernames: d.usernames };
-  if (!d || !sources || (d.hashtags.length === 0 && !Object.values(sources).some((x) => x.length))) {
+  // TikTok шукає ще й серед TikTok-акаунтів вашої бази Instagram — джерело є завжди.
+  if (!d || !sources || (d.platform !== "tiktok" && d.hashtags.length === 0 && !Object.values(sources).some((x) => x.length))) {
     redirect(`/search?msg=${encodeURIComponent("Перевірте форму: потрібні назва і хоча б одне джерело (хештег, запит, бренд, зразок, місце чи список імен)")}`);
   }
   const formats = form.getAll("formats").map(String).filter((f): f is ContentFormat => FORMATS.includes(f as ContentFormat));
   const m = (k: keyof typeof d) => d[k] as CriterionMode;
   const [row] = await getDb().insert(searches).values({
-    name: d.name, focus: d.focus, brief: d.brief, brandName: d.brandName, offer: d.offer, letterExample: d.letterExample,
+    name: d.name, platform: d.platform, focus: d.focus, brief: d.brief, brandName: d.brandName, offer: d.offer, letterExample: d.letterExample,
     outreachLanguage: d.outreachLanguage, hashtags: d.hashtags, keywords: d.keywords, stopWords: d.stopWords, sources,
     postsPerTag: d.postsPerTag, maxProfiles: d.maxProfiles, minFollowers: d.minFollowers, maxFollowers: d.maxFollowers,
     countries: d.countries, languages: d.languages, auditLimit: d.auditLimit, deepLimit: d.deepLimit, commentsLimit: d.commentsLimit,

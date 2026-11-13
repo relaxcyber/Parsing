@@ -5,9 +5,10 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { z } from "zod";
 import { getDb } from "@/db/client";
-import { clients, mailboxes, type ClientPolicy } from "@/db/schema";
+import { clients, mailboxes, timeEntries, type ClientBilling, type ClientPolicy } from "@/db/schema";
 import { encryptSecret } from "@/keys/crypto";
 import { requireAuth } from "@/lib/auth";
+import { checkDomain } from "@/outreach/deliver";
 import { testMailbox } from "@/outreach/engine";
 import { DEFAULT_POLICY, policyOf } from "@/outreach/policy";
 
@@ -63,7 +64,8 @@ export async function saveClient(form: FormData) {
     senderName: str(form, "senderName", 80),
   };
   const mailboxId = z.coerce.number().int().positive().nullable().catch(null).parse(form.get("mailboxId") || null);
-  await db.update(clients).set({ name: str(form, "name", 80) || c.name, policy, mailboxId }).where(eq(clients.id, id));
+  const mailboxPool = [...new Set(form.getAll("pool").map(Number).filter((n) => Number.isInteger(n) && n > 0 && n !== mailboxId))];
+  await db.update(clients).set({ name: str(form, "name", 80) || c.name, policy, mailboxId, mailboxPool }).where(eq(clients.id, id));
   back(`/clients/${id}`, "Правила збережено");
 }
 
@@ -110,13 +112,16 @@ export async function addMailbox(form: FormData) {
     username: str(form, "username", 200) || email,
     passwordEnc: encryptSecret(password),
     dailyLimit: z.coerce.number().int().min(1).max(500).catch(30).parse(form.get("dailyLimit") || 30),
+    warmup: form.get("warmup") === "on",
   };
   if (!values.smtpHost || !values.imapHost) back("/clients", "Вкажіть сервери SMTP та IMAP або виберіть поштовий сервіс");
   const db = getDb();
   const [row] = await db.insert(mailboxes).values(values).onConflictDoUpdate({ target: mailboxes.email, set: values }).returning();
   const error = await testMailbox(row);
-  await db.update(mailboxes).set({ lastError: error }).where(eq(mailboxes.id, row.id));
-  back("/clients", error ? `Скриньку збережено, але підключитися не вдалося: ${error}` : "Скриньку підключено: надсилання й читання працюють");
+  const dns = await checkDomain(email);
+  await db.update(mailboxes).set({ lastError: error, dns }).where(eq(mailboxes.id, row.id));
+  const dnsNote = dns.warnings.length && !dns.freemail ? ` Домен: ${dns.warnings.length} зауваж. — дивіться таблицю скриньок.` : "";
+  back("/clients", error ? `Скриньку збережено, але підключитися не вдалося: ${error}` : `Скриньку підключено: надсилання й читання працюють.${dnsNote}`);
 }
 
 export async function checkMailbox(form: FormData) {
@@ -125,8 +130,54 @@ export async function checkMailbox(form: FormData) {
   const [mb] = await db.select().from(mailboxes).where(eq(mailboxes.id, idOf(form)));
   if (!mb) back("/clients", "Скриньку не знайдено");
   const error = await testMailbox(mb);
-  await db.update(mailboxes).set({ lastError: error }).where(eq(mailboxes.id, mb.id));
-  back("/clients", error ? `Підключитися не вдалося: ${error}` : "Скринька працює");
+  const dns = await checkDomain(mb.email);
+  await db.update(mailboxes).set({ lastError: error, dns }).where(eq(mailboxes.id, mb.id));
+  back("/clients", error ? `Підключитися не вдалося: ${error}` : `Скринька працює${dns.warnings.length && !dns.freemail ? `; домен: ${dns.warnings.join("; ")}` : ""}`);
+}
+
+/** Відновити зупинену скриньку — після того, як ви розібралися з причиною. */
+export async function resumeMailbox(form: FormData) {
+  await requireAuth();
+  await getDb().update(mailboxes).set({ pausedAt: null, pausedReason: null }).where(eq(mailboxes.id, idOf(form)));
+  back("/clients", "Скриньку відновлено. Якщо причина не усунена, вона знову зупиниться");
+}
+
+export async function setWarmup(form: FormData) {
+  await requireAuth();
+  await getDb().update(mailboxes).set({ warmup: form.get("warmup") === "on" }).where(eq(mailboxes.id, idOf(form)));
+  back("/clients", "Збережено");
+}
+
+export async function saveBilling(form: FormData) {
+  await requireAuth();
+  const id = idOf(form);
+  const billing: ClientBilling = {
+    model: z.enum(["retainer", "per_post", "both", "none"]).catch("none").parse(form.get("model")),
+    retainerUsd: money(form, "retainerUsd"),
+    perPostUsd: money(form, "perPostUsd"),
+    startedAt: /^\d{4}-\d{2}-\d{2}$/.test(str(form, "startedAt")) ? str(form, "startedAt") : null,
+    creatorFeesBy: form.get("creatorFeesBy") === "me" ? "me" : "brand",
+    productBy: form.get("productBy") === "me" ? "me" : "brand",
+  };
+  await getDb().update(clients).set({ billing }).where(eq(clients.id, id));
+  back(`/clients/${id}`, "Умови оплати збережено");
+}
+
+export async function addTime(form: FormData) {
+  await requireAuth();
+  const clientId = idOf(form, "clientId");
+  const hours = Number(str(form, "hours").replace(",", "."));
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(str(form, "day")) ? str(form, "day") : new Date().toISOString().slice(0, 10);
+  if (!Number.isFinite(hours) || hours <= 0 || hours > 24) back(`/clients/${clientId}`, "Вкажіть години (напр. 1,5)");
+  await getDb().insert(timeEntries).values({ clientId, day, minutes: Math.round(hours * 60), note: str(form, "note", 200) || null });
+  back(`/clients/${clientId}`, "Час записано");
+}
+
+export async function deleteTime(form: FormData) {
+  await requireAuth();
+  const clientId = idOf(form, "clientId");
+  await getDb().delete(timeEntries).where(eq(timeEntries.id, idOf(form)));
+  revalidatePath(`/clients/${clientId}`);
 }
 
 export async function deleteMailbox(form: FormData) {

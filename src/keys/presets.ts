@@ -12,6 +12,10 @@ export const PRESETS: Preset[] = [
   { slug: "apify", name: "Apify", kind: "scraper" },
   { slug: "firecrawl", name: "Firecrawl", kind: "scraper" },
   { slug: "reddit", name: "Reddit API", kind: "scraper" },
+  // Перевірка адрес перед першим листом: недоставлені листи псують репутацію скриньки.
+  { slug: "millionverifier", name: "MillionVerifier (перевірка email)", kind: "scraper" },
+  { slug: "zerobounce", name: "ZeroBounce (перевірка email)", kind: "scraper" },
+  { slug: "hunter", name: "Hunter (перевірка email)", kind: "scraper" },
   { slug: "openrouter", name: "OpenRouter", kind: "llm", baseUrl: "https://openrouter.ai/api/v1" },
   { slug: "gemini", name: "Google Gemini", kind: "llm", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai" },
   { slug: "groq", name: "Groq", kind: "llm", baseUrl: "https://api.groq.com/openai/v1", model: "qwen/qwen3.8-27b" },

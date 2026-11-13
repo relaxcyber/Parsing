@@ -93,3 +93,17 @@ export async function deleteProvider(form: FormData) {
     .returning({ id: providers.id });
   back(gone.length ? "Провайдера та його ключі видалено" : "Вбудованого провайдера видалити не можна");
 }
+
+/** Резервна копія бази зараз (а не о звичайній щоденній порі). */
+export async function backupNow() {
+  await requireAuth();
+  const { backupDatabase } = await import("@/backup");
+  let msg: string;
+  try {
+    const r = await backupDatabase(getDb());
+    msg = `Копію збережено: ${r.file} (${(r.bytes / 1024 / 1024).toFixed(1)} МБ)`;
+  } catch (e) {
+    msg = `Копію не збережено: ${e instanceof Error ? e.message : e}`;
+  }
+  back(msg);
+}

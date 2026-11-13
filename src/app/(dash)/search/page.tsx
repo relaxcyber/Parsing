@@ -85,7 +85,7 @@ export default async function SearchPage({ searchParams }: { searchParams: Promi
                         <span className="status"><i style={{ background: STATUS[r.status].color }} />{STATUS[r.status].label}</span>
                         {r.status === "running" && r.progress && <div className="muted">{r.progress.stage}</div>}
                       </td>
-                      <td className="muted" style={{ maxWidth: 260 }}>{sources.slice(0, 6).join(" ")}{sources.length > 6 ? " …" : ""}</td>
+                      <td className="muted" style={{ maxWidth: 260 }}>{r.platform === "tiktok" ? "TikTok: " : ""}{sources.slice(0, 6).join(" ")}{sources.length > 6 ? " …" : ""}</td>
                       <td className="num">{r.stats.authors ?? "—"}</td>
                       <td className="num">{r.stats.qualified ?? "—"}</td>
                       <td className="num">{r.stats.leads ?? "—"}{r.targetLeads ? <span className="muted"> / {r.targetLeads}</span> : null}</td>

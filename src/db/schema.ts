@@ -233,6 +233,10 @@ export const creatorContacts = pgTable(
     sourceUrl: text("source_url").notNull(),
     foundAt: ts("found_at").notNull().defaultNow(),
     checkedAt: ts("checked_at").notNull().defaultNow(),
+    /** Перевірка сервісом (ZeroBounce, MillionVerifier, Hunter) перед першим листом. */
+    verdict: text("verdict").$type<"valid" | "invalid" | "risky" | "unknown">(),
+    verifiedBy: text("verified_by"),
+    verifiedAt: ts("verified_at"),
   },
   (t) => [uniqueIndex("creator_contacts_unique_idx").on(t.creatorId, t.email)],
 ).enableRLS();
@@ -497,11 +501,26 @@ export type ClientPolicy = {
   senderName: string;
 };
 
+export type ClientBilling = {
+  model?: "retainer" | "per_post" | "both" | "none";
+  retainerUsd?: number | null;
+  perPostUsd?: number | null;
+  /** З якої дати рахувати абонемент (YYYY-MM-DD). */
+  startedAt?: string | null;
+  /** Хто платить авторам і за товар: якщо ви — це ваші витрати. */
+  creatorFeesBy?: "brand" | "me";
+  productBy?: "brand" | "me";
+};
+
 export const clients = pgTable("clients", {
   id: serial("id").primaryKey(),
   name: text("name").notNull(),
   policy: jsonb("policy").$type<ClientPolicy>().notNull(),
   mailboxId: integer("mailbox_id").references(() => mailboxes.id, { onDelete: "set null" }),
+  /** Додаткові скриньки: нові листування розподіляються між ними за вільним денним лімітом. */
+  mailboxPool: jsonb("mailbox_pool").$type<number[]>().notNull().default([]),
+  /** Як вам платить клієнт — для розрахунку прибутковості. */
+  billing: jsonb("billing").$type<ClientBilling>().notNull().default({}),
   createdAt: ts("created_at").notNull().defaultNow(),
 }).enableRLS();
 
@@ -523,15 +542,41 @@ export const mailboxes = pgTable("mailboxes", {
   uidValidity: text("uid_validity"),
   lastPolledAt: ts("last_polled_at"),
   lastError: text("last_error"),
+  /** Поступовий розгін: нова скринька починає з 5 листів на добу й додає по 2 щодня до денного ліміту. */
+  warmup: boolean("warmup").notNull().default(true),
+  /** Скриньку зупинено (забагато недоставлених листів чи помилок надсилання) — листи з неї не йдуть. */
+  pausedAt: ts("paused_at"),
+  pausedReason: text("paused_reason"),
+  /** SPF, DKIM, DMARC домену відправника. */
+  dns: jsonb("dns").$type<DomainCheck>(),
   createdAt: ts("created_at").notNull().defaultNow(),
 }).enableRLS();
+
+export type DomainCheck = {
+  checkedAt: string; domain: string; freemail: boolean;
+  spf: string | null; dmarc: string | null; dkimSelector: string | null; warnings: string[];
+};
+
+/** Облік часу на клієнта: скільки годин пішло — щоб бачити реальну ставку за годину. */
+export const timeEntries = pgTable(
+  "time_entries",
+  {
+    id: serial("id").primaryKey(),
+    clientId: integer("client_id").notNull().references(() => clients.id, { onDelete: "cascade" }),
+    day: text("day").notNull(),
+    minutes: integer("minutes").notNull(),
+    note: text("note"),
+    createdAt: ts("created_at").notNull().defaultNow(),
+  },
+  (t) => [index("time_entries_client_idx").on(t.clientId, t.day)],
+).enableRLS();
 
 export type ThreadStatus =
   | "draft" | "sent" | "negotiating" | "agreed" | "to_ship" | "shipped" | "posted" | "declined" | "no_reply" | "closed";
 
 /** Узгоджені умови: що й за скільки автор робить. */
 export type ThreadTerms = { feeUsd: number | null; barter: boolean; deliverables: string; deadlineDays: number };
-export type PostCheck = { checkedAt: string; found: boolean; url?: string; disclosure?: boolean; tags?: string[]; note?: string };
+export type PostCheck = { checkedAt: string; found: boolean; url?: string; disclosure?: boolean; tags?: string[]; note?: string; videos?: number };
 
 /** Листування з автором від імені клієнта: один ланцюжок на пару «автор — клієнт». */
 export const outreachThreads = pgTable(

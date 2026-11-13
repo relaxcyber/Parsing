@@ -132,6 +132,8 @@ export type PostMetrics = {
   hiddenLikes: boolean;
   erLikes: number | null;
   erComments: number | null;
+  /** TikTok: залученість — середнє за весь час (з загальної кількості вподобань), а не за останні дописи. */
+  lifetime?: boolean;
 };
 
 const round = (n: number | null, digits = 4) => (n == null ? null : Math.round(n * 10 ** digits) / 10 ** digits);

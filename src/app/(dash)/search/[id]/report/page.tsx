@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { profileLabel } from "@/lib/profile-url";
 import { notFound } from "next/navigation";
 import { and, desc, eq } from "drizzle-orm";
 import type { AdsReport } from "@/analysis/ads";
@@ -63,7 +64,7 @@ export default async function ClientReport({ params, searchParams }: { params: P
               <div style={{ flex: 1, minWidth: 260 }}>
                 <h2 style={{ marginBottom: 4 }}>{i + 1}. @{c.username} {c.displayName ? <span className="muted">· {c.displayName}</span> : null}</h2>
                 <p className="muted" style={{ marginTop: 0 }}>
-                  instagram.com/{c.username} · {c.followers != null ? `${nf.format(c.followers)} підписників` : ""}
+                  {profileLabel(c.platform, c.username)} · {c.followers != null ? `${nf.format(c.followers)} підписників` : ""}
                   {c.erLikes != null ? ` · залученість ${(c.erLikes * 100).toFixed(1)}%` : ""}
                   {trust?.norm ? ` (норма ${(trust.norm.erLikes * 100).toFixed(1)}%)` : ""}
                   {c.country ? ` · ${c.country}` : ""}{c.language ? ` · ${c.language}` : ""}

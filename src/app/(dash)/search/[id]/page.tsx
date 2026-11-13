@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { profileUrl } from "@/lib/profile-url";
 import { STATUS_LABELS } from "../../creators/labels";
 import { startForSearch } from "../../inbox/actions";
 import { notFound } from "next/navigation";
@@ -110,7 +111,7 @@ export default async function SearchDetail({ params, searchParams }: {
       <p className="muted"><Link href="/search">← Усі пошуки</Link></p>
       <h1>{s.name}</h1>
       <p className="sub">
-        {s.focus === "affiliate" ? "Афіліати" : "UGC-креатори"} · {[...s.hashtags.map((h) => `#${h}`), ...(src.bioQueries ?? []).map((q) => `«${q}»`),
+        {s.platform === "tiktok" ? "TikTok" : "Instagram"} · {s.focus === "affiliate" ? "Афіліати" : "UGC-креатори"} · {[...s.hashtags.map((h) => `#${h}`), ...(src.bioQueries ?? []).map((q) => `«${q}»`),
           ...(src.competitors ?? []).map((c) => `відмітки @${c}`), ...(src.seeds ?? []).map((c) => `схожі на @${c}`), ...(src.places ?? []).map((p) => `місце ${p}`),
           ...(src.webQueries ?? []).map((q) => `веб «${q}»`), ...(src.usernames?.length ? [`список із ${src.usernames.length}`] : [])].join(" · ")}
         {" "}· листи: {LANGS[s.outreachLanguage] ?? s.outreachLanguage} · витрати Apify до {usd(estimateCostUsd(s))}
@@ -231,7 +232,7 @@ export default async function SearchDetail({ params, searchParams }: {
                     <tr key={cand.id}>
                       <td style={{ minWidth: 190 }}>
                         <Link href={`/creators/${c.id}?search=${s.id}`}><b>@{c.username}</b></Link>
-                        {" "}<a href={`https://www.instagram.com/${c.username}/`} target="_blank" rel="noreferrer" className="muted" aria-label={`Instagram @${c.username}`}>↗</a>
+                        {" "}<a href={profileUrl(c.platform, c.username)} target="_blank" rel="noreferrer" className="muted" aria-label={`Профіль @${c.username}`}>↗</a>
                         {cand.lead && <div><span className="badge">готовий лід</span></div>}
                         {c.outreachStatus !== "new" && <div><span className="badge">{STATUS_LABELS[c.outreachStatus]}</span></div>}
                         <div className="muted">{[c.displayName, c.followers != null ? `${nf.format(c.followers)} підписників` : null].filter(Boolean).join(" · ")}</div>

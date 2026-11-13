@@ -51,6 +51,7 @@ export const QUALITY_LEAD = DEFAULT_CRITERIA.quality.lead;
 
 /** Оцінка максимальних витрат Apify: усі джерела, усі профілі й платні коментарі (або бюджет, якщо він менший). */
 export function estimateCostUsd(s: Search): number {
+  if (s.platform === "tiktok") return 0; // профілі TikTok — з публічних сторінок, без Apify
   const sources = planSources(s).reduce((a, t) => a + t.estimateUsd, 0);
   const seeds = sourcesOf(s).seeds.length * PRICE.profile;
   const comments = s.commentsLimit * COMMENT_POSTS * COMMENTS_PER_POST * PRICE.comment;
@@ -201,7 +202,13 @@ export async function runSearch(db: Db, searchId: number): Promise<void> {
     ctx.examples = await verdictExamples(db);
     const used = new Set(search.hashtags);
     const extraTags: string[] = [];
-    const seeds = sourcesOf(search).seeds;
+    const seeds = search.platform === "tiktok" ? [] : sourcesOf(search).seeds;
+    if (search.platform === "tiktok") {
+      const src = sourcesOf(search);
+      const unsupported = [src.seeds.length && "схожі на зразки", src.competitors.length && "відмітки брендів", src.places.length && "місця"].filter(Boolean);
+      if (unsupported.length) ctx.notes.push(`TikTok: ${unsupported.join(", ")} не підтримуються — TikTok віддає їх лише своєму застосунку`);
+      ctx.notes.push("TikTok: профілі зібрано безкоштовно з публічних сторінок; ролики й коментарі недоступні, тож візуальний аудит і розбір роликів не виконуються");
+    }
     if (seeds.length) {
       if (canSpend(ctx, seeds.length * PRICE.profile)) {
         await setProgress(db, searchId, { stage: "Вивчаю авторів-зразків", done: 0, total: seeds.length }, stats);
@@ -369,7 +376,8 @@ async function evaluate(ctx: Ctx, names: string[]): Promise<void> {
   // 3. Профілі — лише для відібраних і лише тих, кого давно не збирали; у межах бюджету.
   const freshAfter = new Date(now.getTime() - PROFILE_FRESH_MS);
   let need = shortlist.filter((s) => !s.c.profileFetchedAt || s.c.profileFetchedAt < freshAfter).map((s) => s.username);
-  const affordable = ctx.budget == null ? need.length : Math.max(0, Math.floor((ctx.budget - ctx.spent) / PRICE.profile + 1e-9));
+  const tiktok = search.platform === "tiktok";
+  const affordable = ctx.budget == null || tiktok ? need.length : Math.max(0, Math.floor((ctx.budget - ctx.spent) / PRICE.profile + 1e-9));
   const unpaid = new Set(need.slice(affordable));
   if (unpaid.size) ctx.notes.push(`Не вистачило бюджету на ${unpaid.size} профілів`);
   need = need.slice(0, affordable);
@@ -381,7 +389,8 @@ async function evaluate(ctx: Ctx, names: string[]): Promise<void> {
   for (let i = 0; i < need.length; i += PROFILE_CHUNK) {
     await setProgress(db, search.id, { stage: "Збираю профілі відібраних авторів", done: i, total: need.length }, stats);
     const chunk = need.slice(i, i + PROFILE_CHUNK);
-    const { batch } = await collectProfiles(db, chunk);
+    const { batch } = await collectProfiles(db, chunk, { platform: search.platform });
+    if ((batch as { limited?: boolean }).limited) ctx.notes.push("TikTok тимчасово обмежив запити — частину профілів не зібрано, запустіть пошук знову пізніше");
     const each = (batch.costUsd ?? chunk.length * PRICE.profile) / chunk.length;
     for (const u of chunk) charge(ctx, each, ctx.authors.get(u)?.source);
     const seen = new Set<string>();
@@ -516,7 +525,8 @@ async function evaluate(ctx: Ctx, names: string[]): Promise<void> {
 
   // 8. Візуальний аудит найкращих; біля порога — друга думка іншої моделі або позначка «перегляньте».
   const auditFreshAfter = new Date(now.getTime() - AUDIT_FRESH_MS);
-  const toAudit = alive.slice(0, Math.max(0, ctx.left.audits));
+  // TikTok: кадрів безкоштовно не дістати — візуальний аудит не запускаємо.
+  const toAudit = search.platform === "tiktok" ? [] : alive.slice(0, Math.max(0, ctx.left.audits));
   ctx.left.audits -= toAudit.length;
   stats.audited ??= 0;
   for (const [i, row] of toAudit.entries()) {
@@ -650,7 +660,11 @@ async function evaluate(ctx: Ctx, names: string[]): Promise<void> {
     reasons.push(...crit.notes);
     if (row.c.reviewNote) reasons.push(row.c.reviewNote);
     const emailOk = ctx.criteria.email === "off" || facts.hasEmail === true;
-    const lead = ok && activityStatus(row.c.lastPostAt, now) === "active" && emailOk && quality != null && quality >= ctx.criteria.quality.lead && row.trust?.risk !== "high";
+    // TikTok: дати роликів і кадрів безкоштовно не дістати — лідом стає автор з email і без високого ризику,
+    // а активність і якість зйомки ви перевіряєте самі, глянувши профіль.
+    const tiktokLead = search.platform === "tiktok" && ok && emailOk && row.trust?.risk !== "high" && activityStatus(row.c.lastPostAt, now) !== "ghost";
+    if (tiktokLead) reasons.push("TikTok: активність і якість зйомки не перевірено — гляньте профіль перед листом");
+    const lead = tiktokLead || (ok && activityStatus(row.c.lastPostAt, now) === "active" && emailOk && quality != null && quality >= ctx.criteria.quality.lead && row.trust?.risk !== "high");
     if (ok) ctx.qualified.add(row.c.username);
     finalRows.push({ row, stage: ok ? ("qualified" as const) : ("rejected" as const), readiness: r.readiness, quality, trust: row.trust?.score ?? null, match: crit.match, reasons: [...reasons, ...reject], lead });
   }
@@ -676,6 +690,13 @@ async function applyProfile(ctx: Ctx, c: Creator, raw: any, posts: PostFacts[]):
   const { db, now } = ctx;
   const followers = typeof raw.followersCount === "number" && raw.followersCount >= 0 ? Math.round(raw.followersCount) : null;
   const m = postMetrics(posts, followers);
+  // TikTok: роликів у відповіді немає, але є всі вподобання й кількість роликів — середнє за весь час.
+  const likesTotal = typeof raw.likesTotal === "number" ? raw.likesTotal : null;
+  const videoCount = typeof raw.postsCount === "number" ? raw.postsCount : null;
+  if (m.erLikes == null && likesTotal != null && videoCount && followers) {
+    m.erLikes = Math.round((likesTotal / videoCount / followers) * 10_000) / 10_000;
+    m.lifetime = true;
+  }
   const act = activityOf(posts.map((p) => ({ publishedAt: p.publishedAt ?? undefined, metrics: { views: p.views ?? undefined } })), followers, now);
   const links = [raw.externalUrl, ...(Array.isArray(raw.externalUrls) ? raw.externalUrls.map((l: any) => l?.url) : [])]
     .filter((l, i, a): l is string => typeof l === "string" && /^https?:\/\//.test(l) && a.indexOf(l) === i);

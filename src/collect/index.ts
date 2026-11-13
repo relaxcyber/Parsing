@@ -12,10 +12,12 @@ import {
 import { fetchLocal, LocalMiss } from "./local";
 import { assertPublicUrl, normalizeUrl } from "./net";
 import { fetchScrapling, ScraplingMissing } from "./scrapling";
+import { fetchTikTokProfiles } from "./tiktok";
 
 export type Target =
   | { type: "url"; url: string }
   | { type: "instagram-profile"; username: string }
+  | { type: "tiktok-profile"; username: string }
   | { type: "instagram-hashtag"; tag: string; limit?: number }
   | { type: "instagram-search"; query: string; limit?: number }
   | { type: "instagram-tagged"; username: string; limit?: number }
@@ -43,6 +45,10 @@ function resolveTarget(target: Target): { target: Target; key: string; ttlMs: nu
   if (target.type === "instagram-profile") {
     const username = cleanHandle(target.username).toLowerCase();
     return { target: { type: "instagram-profile", username }, key: `ig-profile:${username}`, ttlMs: 24 * HOUR };
+  }
+  if (target.type === "tiktok-profile") {
+    const username = target.username.trim().replace(/^@/, "").replace(/^https?:\/\/(www\.)?tiktok\.com\/@/i, "").replace(/[/?#].*$/, "").toLowerCase();
+    return { target: { type: "tiktok-profile", username }, key: `tt-profile:${username}`, ttlMs: 24 * HOUR };
   }
   const lim = (v: number | undefined, def: number) => Math.min(Math.max(Math.round(v ?? def), 1), 200);
   switch (target.type) {
@@ -83,6 +89,11 @@ function resolveTarget(target: Target): { target: Target; key: string; ttlMs: nu
 async function runTarget(db: Db, target: Exclude<Target, { type: "url" }>, onStart: (id: string) => Promise<void>): Promise<Batch> {
   switch (target.type) {
     case "instagram-profile": return fetchInstagramProfiles(db, [target.username], { onStart });
+    case "tiktok-profile": {
+      const b = await fetchTikTokProfiles([target.username]);
+      if (!b.collected.length && b.skipped.length) throw new Error(b.skipped[0]);
+      return b;
+    }
     case "instagram-hashtag": return fetchInstagramHashtag(db, target.tag, target.limit!, { onStart });
     case "instagram-search": return fetchInstagramUserSearch(db, target.query, target.limit!, { onStart });
     case "instagram-tagged": return fetchInstagramTagged(db, target.username, target.limit!, { onStart });
@@ -230,17 +241,21 @@ export async function collect(db: Db, input: Target, opts: { fresh?: boolean } =
  * Профілі пачкою — одним запуском актора (дешевше й швидше, ніж по одному).
  * Повертає сирі записи профілів разом з елементами; цілі з одним і тим самим набором імен кешуються 24 год.
  */
-export async function collectProfiles(db: Db, usernames: string[], _opts: { fresh?: boolean } = {}): Promise<{ batch: Batch; ids: number[] }> {
+export async function collectProfiles(
+  db: Db, usernames: string[], opts: { fresh?: boolean; platform?: string } = {},
+): Promise<{ batch: Batch; ids: number[] }> {
+  const tiktok = opts.platform === "tiktok";
   const names = [...new Set(usernames.map((u) => cleanHandle(u).toLowerCase()))].sort();
   if (names.length === 0) return { batch: { collected: [], skipped: [] }, ids: [] };
-  const key = `ig-profiles:${createHash("sha1").update(names.join(",")).digest("hex").slice(0, 16)}:${names.length}`;
+  const key = `${tiktok ? "tt" : "ig"}-profiles:${createHash("sha1").update(names.join(",")).digest("hex").slice(0, 16)}:${names.length}`;
 
   await db.update(collectRuns).set({ status: "failed", error: "перервано", finishedAt: new Date() })
     .where(and(eq(collectRuns.targetKey, key), eq(collectRuns.status, "running"), lt(collectRuns.startedAt, new Date(Date.now() - STALE_RUN_MS))));
   const [run] = await db.insert(collectRuns).values({ targetKey: key }).onConflictDoNothing().returning({ id: collectRuns.id });
   if (!run) throw new AlreadyRunningError("Ці профілі вже збираються");
   try {
-    const batch = await fetchInstagramProfiles(db, names, {
+    // TikTok — безкоштовно, з публічних сторінок профілів; Instagram — актор Apify.
+    const batch = tiktok ? await fetchTikTokProfiles(names) : await fetchInstagramProfiles(db, names, {
       onStart: async (externalRunId) => {
         await db.update(collectRuns).set({ externalRunId }).where(eq(collectRuns.id, run.id));
       },

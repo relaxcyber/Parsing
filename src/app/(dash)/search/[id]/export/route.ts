@@ -1,4 +1,5 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
+import { profileUrl } from "@/lib/profile-url";
 import { getDb } from "@/db/client";
 import { creatorContacts, creators, searchCandidates, searches } from "@/db/schema";
 import { isAuthed } from "@/lib/auth";
@@ -33,7 +34,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       const audit = c.audit as { aesthetic?: string } | null;
       const ads = c.ads as { adPosts?: number } | null;
       return [
-        c.emails[0] ?? "", (c.displayName ?? "").split(/[\s|,]/)[0] ?? "", c.username, `https://www.instagram.com/${c.username}/`, c.followers ?? "",
+        c.emails[0] ?? "", (c.displayName ?? "").split(/[\s|,]/)[0] ?? "", c.username, profileUrl(c.platform, c.username), c.followers ?? "",
         Math.round(cand.score), cand.fit ?? "", cand.readiness ?? "", cand.quality ?? "", cand.trust ?? "", c.trustRisk ?? "",
         c.erLikes != null ? Math.round(c.erLikes * 10000) / 100 : "", ads?.adPosts ?? "", c.adQuality ?? "",
         cand.lead ? "yes" : "no", k?.status ?? "", k?.sourceUrl ?? "",

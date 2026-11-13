@@ -8,7 +8,7 @@ type Values = Record<string, string>;
 
 /** Значення за замовчуванням — ті самі, що й у коді пошуку (src/search/criteria.ts). */
 const DEFAULTS: Values = {
-  focus: "ugc", outreachLanguage: "en", postsPerTag: "50", maxProfiles: "150", auditLimit: "30", deepLimit: "10", commentsLimit: "0",
+  focus: "ugc", platform: "instagram", outreachLanguage: "en", postsPerTag: "50", maxProfiles: "150", auditLimit: "30", deepLimit: "10", commentsLimit: "0",
   excludeContacted: "on", "c.followers": "required", "c.country": "required", "c.language": "required", "c.activity": "required",
   activityDays: "30", "c.er": "off", erMinPct: "1", "c.email": "preferred", "c.ads": "off", "c.trust": "required", trustMaxRisk: "medium",
   "c.formats": "off", formats: "", qualityMin: "40", qualityLead: "70",
@@ -116,6 +116,13 @@ export function SearchForm({ templates, clients = [] }: { templates: { name: str
           <legend>Що шукаємо</legend>
           <div className="grid">
             <label>Назва<input name="name" required maxLength={80} placeholder="напр. Косметика, осінь" defaultValue={v.name} /></label>
+            <label>
+              Платформа
+              <select name="platform" defaultValue={v.platform}>
+                <option value="instagram">Instagram (Apify)</option>
+                <option value="tiktok">TikTok (безкоштовно: ваш список, вебпошук, з бази Instagram)</option>
+              </select>
+            </label>
             <label>
               Кого шукаємо
               <select name="focus" defaultValue={v.focus}>

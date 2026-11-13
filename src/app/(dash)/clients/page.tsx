@@ -1,16 +1,17 @@
 import Link from "next/link";
 import { asc, sql } from "drizzle-orm";
 import { getDb } from "@/db/client";
-import { clients, mailboxes, outreachMessages, outreachThreads } from "@/db/schema";
+import { clients, mailboxes, outreachThreads } from "@/db/schema";
 import { ConfirmButton } from "../keys/confirm-button";
-import { addMailbox, checkMailbox, createClient, deleteMailbox } from "./actions";
+import { mailboxHealth } from "@/outreach/deliver";
+import { addMailbox, checkMailbox, createClient, deleteMailbox, resumeMailbox, setWarmup } from "./actions";
 
 const df = new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
 
 export default async function ClientsPage({ searchParams }: { searchParams: Promise<{ msg?: string }> }) {
   const { msg } = await searchParams;
   const db = getDb();
-  const [rows, boxes, stats, sent] = await Promise.all([
+  const [rows, boxes, stats] = await Promise.all([
     db.select().from(clients).orderBy(asc(clients.name)),
     db.select().from(mailboxes).orderBy(asc(mailboxes.email)),
     db.select({
@@ -19,9 +20,8 @@ export default async function ClientsPage({ searchParams }: { searchParams: Prom
       human: sql<number>`count(*) filter (where ${outreachThreads.needsHuman} is not null)::int`,
       posted: sql<number>`count(*) filter (where ${outreachThreads.status} = 'posted')::int`,
     }).from(outreachThreads).groupBy(outreachThreads.clientId),
-    db.select({ mailboxId: outreachMessages.mailboxId, n: sql<number>`count(*)::int` }).from(outreachMessages)
-      .where(sql`${outreachMessages.status} = 'sent' and ${outreachMessages.sentAt} > now() - interval '1 day'`).groupBy(outreachMessages.mailboxId),
   ]);
+  const health = await Promise.all(boxes.map((b) => mailboxHealth(db, b)));
 
   return (
     <>
@@ -64,24 +64,47 @@ export default async function ClientsPage({ searchParams }: { searchParams: Prom
         <p className="muted">
           З цих скриньок ідуть листи авторам і з них читаються відповіді. Для Gmail увімкніть двоетапну перевірку й створіть
           «Пароль застосунку» (Google-акаунт → Безпека → Паролі застосунків) — звичайний пароль не підійде. Краще окрема скринька
-          на окремому домені: нова скринька, що надсилає багато листів, швидко потрапляє в спам — починайте з 20–30 на добу.
+          на окремому домені: нова скринька, що надсилає багато листів, швидко потрапляє в спам. Тому нова скринька розганяється
+          (5 листів на добу, +2 щодня до вашого ліміту), адреси перевіряються перед першим листом (якщо на сторінці «Ключі» додано
+          MillionVerifier, ZeroBounce чи Hunter), а коли повернень за тиждень понад 5% — скринька зупиняється сама.
         </p>
         {boxes.length > 0 && (
           <table>
-            <thead><tr><th>Скринька</th><th>Сервери</th><th className="num">Надіслано за добу</th><th>Перевірено</th><th></th></tr></thead>
+            <thead><tr><th>Скринька</th><th>Домен</th><th className="num">Надіслано за добу</th><th className="num">Повернень за тиждень</th><th>Стан</th><th></th></tr></thead>
             <tbody>
-              {boxes.map((b) => (
-                <tr key={b.id}>
-                  <td>{b.email}{b.fromName ? <div className="muted">{b.fromName}</div> : null}</td>
-                  <td className="mono">{b.smtpHost}:{b.smtpPort}<br />{b.imapHost}:{b.imapPort}</td>
-                  <td className="num">{sent.find((x) => x.mailboxId === b.id)?.n ?? 0} з {b.dailyLimit}</td>
-                  <td>{b.lastError ? <span className="err">⚠ {b.lastError}</span> : b.lastPolledAt ? `✓ ${df.format(b.lastPolledAt)}` : "ще ні"}</td>
-                  <td className="actions">
-                    <form action={checkMailbox}><input type="hidden" name="id" value={b.id} /><button className="link">Перевірити</button></form>
-                    <form action={deleteMailbox}><input type="hidden" name="id" value={b.id} /><ConfirmButton question={`Видалити скриньку ${b.email}?`}>Видалити</ConfirmButton></form>
-                  </td>
-                </tr>
-              ))}
+              {boxes.map((b, i) => {
+                const h = health[i];
+                return (
+                  <tr key={b.id}>
+                    <td>{b.email}{b.fromName ? <div className="muted">{b.fromName}</div> : null}<div className="mono">{b.smtpHost}:{b.smtpPort} · {b.imapHost}:{b.imapPort}</div></td>
+                    <td style={{ maxWidth: 280 }}>
+                      {!b.dns ? <span className="muted">не перевірено</span> : b.dns.freemail ? <span className="muted">безкоштовна пошта</span> : (
+                        <span>SPF {b.dns.spf ? "✓" : "✗"} · DKIM {b.dns.dkimSelector ? "✓" : "?"} · DMARC {b.dns.dmarc ? "✓" : "✗"}</span>
+                      )}
+                      {b.dns?.warnings.map((w) => <div key={w} className="muted">⚠ {w}</div>)}
+                    </td>
+                    <td className="num">
+                      {h.sent24h} з {h.limit}
+                      {b.warmup && h.limit < b.dailyLimit && <div className="muted">розгін до {b.dailyLimit}</div>}
+                      <form action={setWarmup} className="muted"><input type="hidden" name="id" value={b.id} />
+                        <label className="check" style={{ justifyContent: "flex-end" }}><input type="checkbox" name="warmup" defaultChecked={b.warmup} />розгін</label>
+                        <button className="link">зберегти</button>
+                      </form>
+                    </td>
+                    <td className="num">{h.sent7d ? `${h.bounced7d} з ${h.sent7d} (${Math.round((h.bounceRate ?? 0) * 100)}%)` : "—"}</td>
+                    <td>
+                      {b.pausedAt ? <span className="risk-high">⏸ зупинено: {b.pausedReason}</span>
+                        : b.lastError ? <span className="err">⚠ {b.lastError}</span>
+                        : b.lastPolledAt ? `✓ ${df.format(b.lastPolledAt)}` : "ще ні"}
+                    </td>
+                    <td className="actions">
+                      {b.pausedAt && <form action={resumeMailbox}><input type="hidden" name="id" value={b.id} /><button>Відновити</button></form>}
+                      <form action={checkMailbox}><input type="hidden" name="id" value={b.id} /><button className="link">Перевірити</button></form>
+                      <form action={deleteMailbox}><input type="hidden" name="id" value={b.id} /><ConfirmButton question={`Видалити скриньку ${b.email}?`}>Видалити</ConfirmButton></form>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -102,6 +125,7 @@ export default async function ClientsPage({ searchParams }: { searchParams: Prom
               </select>
             </label>
             <label>Листів на добу<input name="dailyLimit" type="number" min={1} max={500} defaultValue={30} /></label>
+            <label className="check"><input type="checkbox" name="warmup" defaultChecked />Розгін: 5 на добу, +2 щодня</label>
             <label>SMTP-сервер (для «іншого»)<input name="smtpHost" placeholder="smtp.example.com" /></label>
             <label>SMTP-порт<input name="smtpPort" type="number" placeholder="465" /></label>
             <label>IMAP-сервер<input name="imapHost" placeholder="imap.example.com" /></label>

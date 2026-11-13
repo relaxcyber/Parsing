@@ -1,8 +1,10 @@
 import { collect, collectProfiles } from "@/collect";
 import { cleanHandle } from "@/collect/instagram";
+import { TIKTOK_HANDLE, tiktokHandles } from "@/collect/tiktok";
 import type { ContentItem } from "@/core/contract";
 import type { Db } from "@/db/client";
-import type { Search, SearchSources } from "@/db/schema";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
+import { creators, searchCandidates, type Search, type SearchSources } from "@/db/schema";
 
 /**
  * Джерела кандидатів. Кожне джерело — окреме завдання з оцінкою вартості: автопілот запускає їх
@@ -55,7 +57,55 @@ function collectTask(label: string, estimateUsd: number, target: Parameters<type
   };
 }
 
+/** Пошук у вебі (Firecrawl) й імена TikTok із знайдених сторінок. */
+function tiktokWebTask(label: string, query: string): SourceTask {
+  return {
+    label, estimateUsd: 0,
+    run: async (db) => {
+      const r = await collect(db, { type: "web-search", query, limit: 20 });
+      const found = tiktokHandles(r.items.flatMap((i) => [i.url, i.text ?? "", i.title ?? ""])).map((username) => ({ username, posts: [] }));
+      return { found, costUsd: 0, notes: r.notes.map((n) => `${label}: ${n}`), posts: 0 };
+    },
+  };
+}
+
+/**
+ * TikTok: хештеги й пошук TikTok віддає лише своєму застосунку, тож авторів шукаємо через вебпошук
+ * (site:tiktok.com), ваш список і TikTok-акаунти авторів, яких ваші пошуки Instagram уже відібрали.
+ * Профілі потім перевіряються безкоштовно.
+ */
+export function planTikTokSources(s: Search): SourceTask[] {
+  const src = sourcesOf(s);
+  const tasks: SourceTask[] = [];
+  for (const tag of s.hashtags) tasks.push(tiktokWebTask(`веб: #${tag}`, `site:tiktok.com "#${tag}"`));
+  for (const q of src.bioQueries) tasks.push(tiktokWebTask(`веб: ${q}`, `site:tiktok.com ${q}`));
+  for (const q of src.webQueries) tasks.push(tiktokWebTask(`веб: ${q}`, /tiktok/i.test(q) ? q : `site:tiktok.com ${q}`));
+  if (src.usernames.length) {
+    const names = [...new Set(src.usernames.flatMap((u) => (/tiktok\.com/i.test(u) ? tiktokHandles([u]) : [cleanHandle(u).toLowerCase()])).filter((u) => TIKTOK_HANDLE.test(u)))];
+    tasks.push({ label: "ваш список", estimateUsd: 0, run: async () => ({ found: names.map((username) => ({ username, posts: [] })), costUsd: 0, notes: [], posts: 0 }) });
+  }
+  tasks.push({
+    label: "TikTok авторів з бази Instagram", estimateUsd: 0,
+    run: async (db) => {
+      // Автори Instagram, які вже пройшли відбір у ваших пошуках і мають посилання на TikTok.
+      const rows = await db.selectDistinct({ socials: creators.socials, links: creators.links }).from(creators)
+        .innerJoin(searchCandidates, eq(searchCandidates.creatorId, creators.id))
+        .where(and(eq(creators.platform, "instagram"), eq(searchCandidates.stage, "qualified"), isNotNull(creators.socials),
+          sql`(${creators.socials} ? 'tiktok' or ${creators.links}::text ilike '%tiktok.com/@%')`));
+      const names = new Set<string>();
+      for (const r of rows) {
+        const h = r.socials?.tiktok?.toLowerCase();
+        if (h && TIKTOK_HANDLE.test(h)) names.add(h);
+        tiktokHandles(r.links).forEach((x) => names.add(x));
+      }
+      return { found: [...names].map((username) => ({ username, posts: [] })), costUsd: 0, notes: [], posts: 0 };
+    },
+  });
+  return tasks;
+}
+
 export function planSources(s: Search, extraTags: string[] = []): SourceTask[] {
+  if (s.platform === "tiktok") return planTikTokSources(s);
   const src = sourcesOf(s);
   const tasks: SourceTask[] = [];
   for (const tag of [...s.hashtags, ...extraTags]) {

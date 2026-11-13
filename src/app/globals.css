@@ -119,3 +119,12 @@ pre.draft { white-space: pre-wrap; font: inherit; background: var(--bg); border:
   a { text-decoration: none; }
 }
 textarea { font: inherit; font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--ink); background: var(--bg); border: 1px solid var(--line-2); border-radius: 6px; padding: 7px 9px; resize: vertical; }
+/* Дошка листувань */
+.board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(150px, 1fr); gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+.board-col { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px; min-height: 120px; }
+.board-col h2 { font-size: 14px; margin-bottom: 4px; }
+.board-card { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 4px; }
+.board-card.attention { border-color: var(--critical); }
+.board-card a { text-decoration: none; }
+.board-card button { white-space: normal; text-align: left; }
+.board-card b { overflow-wrap: anywhere; }

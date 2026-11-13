@@ -15,6 +15,7 @@
     "launch": "node scripts/launch.mjs",
     "shortcut": "node scripts/shortcut.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "restore": "tsx --env-file-if-exists=.env --tsconfig tsconfig.json scripts/restore.ts",
     "setup": "tsx scripts/setup.ts"
   },
   "dependencies": {

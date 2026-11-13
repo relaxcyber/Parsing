@@ -2,13 +2,14 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { asc, desc, eq } from "drizzle-orm";
 import { getDb } from "@/db/client";
-import { clients, creators, mailboxes, outreachThreads, searches } from "@/db/schema";
+import { clients, creators, mailboxes, outreachThreads, searches, timeEntries } from "@/db/schema";
 import { clientReport } from "@/outreach/engine";
+import { clientProfit } from "@/outreach/profit";
 import { policyOf } from "@/outreach/policy";
 import { ConfirmButton } from "../../keys/confirm-button";
 import { PrintButton } from "../../creators/print-button";
 import { THREAD_LABELS } from "../../creators/labels";
-import { deleteClient, deleteFaq, saveClient } from "../actions";
+import { addTime, deleteClient, deleteFaq, deleteTime, saveBilling, saveClient } from "../actions";
 
 const df = new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit", year: "numeric" });
 const usd = (n: number | null | undefined) => (n == null ? "—" : `$${n.toFixed(2).replace(".", ",")}`);
@@ -22,19 +23,22 @@ export default async function ClientPage({ params, searchParams }: { params: Pro
   const [c] = await db.select().from(clients).where(eq(clients.id, id));
   if (!c) notFound();
   const p = policyOf(c.policy);
-  const [boxes, threads, report, clientSearches] = await Promise.all([
+  const [boxes, threads, report, clientSearches, profit, times] = await Promise.all([
     db.select().from(mailboxes).orderBy(asc(mailboxes.email)),
     db.select({ t: outreachThreads, username: creators.username }).from(outreachThreads)
       .innerJoin(creators, eq(creators.id, outreachThreads.creatorId)).where(eq(outreachThreads.clientId, id)).orderBy(desc(outreachThreads.updatedAt)).limit(200),
     clientReport(db, id),
     db.select({ id: searches.id, name: searches.name }).from(searches).where(eq(searches.clientId, id)).orderBy(desc(searches.createdAt)).limit(20),
+    clientProfit(db, id),
+    db.select().from(timeEntries).where(eq(timeEntries.clientId, id)).orderBy(desc(timeEntries.day), desc(timeEntries.id)).limit(15),
   ]);
+  const b = c.billing;
 
   return (
     <>
       <div className="actions no-print" style={{ float: "right" }}><PrintButton /></div>
       <h1>{c.name}</h1>
-      <p className="sub"><Link href="/clients" className="no-print">← Клієнти</Link> · Звіт і правила переговорів.</p>
+      <p className="sub"><Link href="/clients" className="no-print">← Клієнти</Link> · <Link href={`/clients/${c.id}/board`} className="no-print">Дошка листувань</Link> · Звіт, прибутковість і правила переговорів.</p>
       {msg && <div className="flash" role="status">{msg}</div>}
 
       <section className="card">
@@ -67,6 +71,57 @@ export default async function ClientPage({ params, searchParams }: { params: Pro
           </table>
         )}
         {clientSearches.length > 0 && <p className="muted">Пошуки: {clientSearches.map((s, i) => <span key={s.id}>{i ? ", " : ""}<Link href={`/search/${s.id}`}>{s.name}</Link></span>)}</p>}
+      </section>
+
+      <section className="card no-print">
+        <h2>Прибутковість</h2>
+        <div className="kv">
+          <div><b>{usd(profit.revenue)}</b><span>отримано від клієнта ({profit.months} міс.)</span></div>
+          <div><b>{usd(profit.costs)}</b><span>ваші витрати: Apify {usd(profit.apifyUsd)}{profit.feesUsd ? `, гонорари ${usd(profit.feesUsd)}` : ""}{profit.productUsd ? `, товар ${usd(profit.productUsd)}` : ""}</span></div>
+          <div><b className={profit.net < 0 ? "risk-high" : undefined}>{usd(profit.net)}</b><span>чистими</span></div>
+          <div><b>{profit.hours.toLocaleString("uk-UA")} год</b><span>вашого часу</span></div>
+          <div><b>{profit.perHour == null ? "—" : usd(profit.perHour)}</b><span>за годину</span></div>
+        </div>
+        <div className="two" style={{ marginTop: 12 }}>
+          <form action={saveBilling} className="stack">
+            <input type="hidden" name="id" value={c.id} />
+            <div className="grid" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10 }}>
+              <label>Як платить клієнт
+                <select name="model" defaultValue={b.model ?? "none"}>
+                  <option value="none">не задано</option><option value="retainer">абонемент</option><option value="per_post">за допис</option><option value="both">абонемент + за допис</option>
+                </select>
+              </label>
+              <label>Абонемент, $/міс<input name="retainerUsd" defaultValue={b.retainerUsd ?? ""} inputMode="decimal" /></label>
+              <label>За допис, $<input name="perPostUsd" defaultValue={b.perPostUsd ?? ""} inputMode="decimal" /></label>
+              <label>Початок роботи<input name="startedAt" type="date" defaultValue={b.startedAt ?? c.createdAt.toISOString().slice(0, 10)} /></label>
+              <label>Гонорари авторам платить
+                <select name="creatorFeesBy" defaultValue={b.creatorFeesBy ?? "brand"}><option value="brand">клієнт</option><option value="me">я</option></select>
+              </label>
+              <label>Товар оплачує
+                <select name="productBy" defaultValue={b.productBy ?? "brand"}><option value="brand">клієнт</option><option value="me">я</option></select>
+              </label>
+            </div>
+            <div className="actions"><button>Зберегти умови оплати</button></div>
+          </form>
+          <div>
+            <form action={addTime} className="actions" style={{ alignItems: "end" }}>
+              <input type="hidden" name="clientId" value={c.id} />
+              <label>Дата<input name="day" type="date" defaultValue={new Date().toISOString().slice(0, 10)} /></label>
+              <label>Годин<input name="hours" inputMode="decimal" placeholder="1,5" style={{ width: 80 }} /></label>
+              <label>Що робили<input name="note" placeholder="напр. відповіді авторам" /></label>
+              <button>Записати час</button>
+            </form>
+            {times.length > 0 && (
+              <ul className="plain muted">
+                {times.map((x) => (
+                  <li key={x.id}>{x.day} · {(x.minutes / 60).toLocaleString("uk-UA", { maximumFractionDigits: 2 })} год{x.note ? ` · ${x.note}` : ""}
+                    <form action={deleteTime} style={{ display: "inline" }}><input type="hidden" name="id" value={x.id} /><input type="hidden" name="clientId" value={c.id} /><button className="link danger">×</button></form>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
       </section>
 
       <section className="card no-print">
@@ -145,7 +200,7 @@ export default async function ClientPage({ params, searchParams }: { params: Pro
                 Скринька
                 <select name="mailboxId" defaultValue={c.mailboxId ?? ""}>
                   <option value="">— не вибрано —</option>
-                  {boxes.map((b) => <option key={b.id} value={b.id}>{b.email}</option>)}
+                  {boxes.map((x) => <option key={x.id} value={x.id}>{x.email}</option>)}
                 </select>
               </label>
               <label>
@@ -157,6 +212,16 @@ export default async function ClientPage({ params, searchParams }: { params: Pro
               </label>
               <label>Нагадати через, днів<input name="followupDays" type="number" min={1} max={30} defaultValue={p.followupDays} /></label>
             </div>
+            {boxes.length > 1 && (
+              <div>
+                <span className="muted">Додаткові скриньки (нові листування розподіляються між ними за вільним лімітом):</span>
+                <div className="checks">
+                  {boxes.filter((x) => x.id !== c.mailboxId).map((x) => (
+                    <label key={x.id} className="check"><input type="checkbox" name="pool" value={x.id} defaultChecked={c.mailboxPool.includes(x.id)} />{x.email}{x.pausedAt ? " (зупинено)" : ""}</label>
+                  ))}
+                </div>
+              </div>
+            )}
             {boxes.length === 0 && <p className="muted">Спершу <Link href="/clients#mailboxes">підключіть скриньку</Link>.</p>}
             <p className="muted">Почніть з режиму «чекає мого Надіслати»: перегляньте 10–20 листів ІІ, і коли вони вас влаштовують — увімкніть автоматичний.</p>
           </fieldset>

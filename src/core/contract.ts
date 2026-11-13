@@ -7,7 +7,7 @@ import { z } from "zod";
 
 export const SOURCES = ["web", "reddit", "instagram", "tiktok", "x"] as const;
 export const KINDS = ["post", "comment", "profile", "article", "video"] as const;
-export const VIA = ["local", "scrapling", "scrapling-stealth", "reddit-api", "firecrawl", "apify"] as const;
+export const VIA = ["local", "scrapling", "scrapling-stealth", "reddit-api", "firecrawl", "apify", "tiktok-page"] as const;
 
 const count = z.number().nonnegative().optional();
 /** Лише http(s): javascript:, file:, data: не мають потрапити у вітрину чи експорт. */

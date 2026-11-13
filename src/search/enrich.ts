@@ -1,4 +1,5 @@
 import { sql, eq } from "drizzle-orm";
+import { profileUrl as profileUrlOf } from "@/lib/profile-url";
 import { getPageHtml } from "@/collect/html";
 import type { Db } from "@/db/client";
 import { creatorContacts, creators, type Creator, type CreatorRate } from "@/db/schema";
@@ -19,7 +20,7 @@ type Enrichment = { emails: { email: string; source: string; sourceUrl: string }
 
 /** Безкоштовне збагачення: біо + посилання профілю + сторінки-візитки. */
 async function collectContacts(c: Creator): Promise<Enrichment> {
-  const profileUrl = `https://www.instagram.com/${c.username}/`;
+  const profileUrl = profileUrlOf(c.platform, c.username);
   const fromProfile = classifyLinks(c.links);
   const out: Enrichment = {
     emails: extractEmails(c.bio).map((email) => ({ email, source: "bio", sourceUrl: profileUrl })),
