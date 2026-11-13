@@ -128,3 +128,5 @@ textarea { font: inherit; font-family: ui-monospace, Menlo, monospace; font-size
 .board-card a { text-decoration: none; }
 .board-card button { white-space: normal; text-align: left; }
 .board-card b { overflow-wrap: anywhere; }
+.letter { white-space: pre-wrap; font: inherit; margin: 6px 0; }
+a.chip { display: inline-block; padding: 2px 9px; font-size: 12px; border-radius: 12px; border: 1px solid var(--line, #ccc); text-decoration: none; }

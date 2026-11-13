@@ -10,6 +10,7 @@ const LINKS = [
   { href: "/clients", label: "Клієнти" },
   { href: "/pitch", label: "Відгуки на замовлення" },
   { href: "/orders", label: "Замовлення" },
+  { href: "/brands", label: "Бренди для креаторів" },
   { href: "/report", label: "Звіт про роботу" },
   { href: "/quality", label: "Точність оцінок" },
   { href: "/scrape", label: "Парсинг сайтів" },

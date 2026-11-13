@@ -799,3 +799,50 @@ export const orders = pgTable("orders", {
 }).enableRLS();
 
 export type Order = typeof orders.$inferSelect;
+
+/* ---------- Бренди для креаторів: хто вже платить авторам у ніші ---------- */
+
+/** Доказ співпраці: рекламний допис автора з відміткою бренду. */
+export type BrandCollab = { creator: string; followers: number | null; postUrl: string; reason: string; paid: boolean; at: string | null };
+export type BrandVerdict = "brand" | "not_brand" | "unsure";
+export type BrandLead = {
+  handle: string;
+  name: string | null;
+  bio: string | null;
+  category: string | null;
+  followers: number | null;
+  website: string | null;
+  email: string | null;
+  /** Звідки email: біо чи сторінка сайту. */
+  emailSource: string | null;
+  verdict: BrandVerdict;
+  verdictWhy: string;
+  /** Ви змінили вердикт вручну. */
+  byYou?: boolean;
+  collabs: BrandCollab[];
+  pitch?: { subject: string; body: string; bodyUk: string; issues: string[] } | null;
+};
+/** Креатор, якому шукаємо бренди: з цього пишуться листи (модель не додасть нічого понад це). */
+export type BrandCreator = { name: string; handle: string; niche: string; followers: string; about: string; portfolio: string; offer: string; style?: string };
+export type BrandScoutStats = { posts: number; creators: number; adPosts: number; candidates: number; brandProfiles: number; withEmail: number; costUsd: number; notes: string[] };
+
+export const brandScouts = pgTable("brand_scouts", {
+  id: serial("id").primaryKey(),
+  niche: text("niche").notNull(),
+  hashtags: jsonb("hashtags").$type<string[]>().notNull().default([]),
+  postsPerTag: integer("posts_per_tag").notNull().default(40),
+  maxCreators: integer("max_creators").notNull().default(60),
+  maxBrands: integer("max_brands").notNull().default(40),
+  status: text("status").$type<"queued" | "running" | "done" | "failed">().notNull().default("queued"),
+  stage: text("stage"),
+  stats: jsonb("stats").$type<Partial<BrandScoutStats>>().notNull().default({}),
+  brands: jsonb("brands").$type<BrandLead[]>().notNull().default([]),
+  creator: jsonb("creator").$type<BrandCreator>(),
+  /** Бренди, яким фоновий виконавець має написати листи (по одному за раз через ліміти моделі). */
+  pitchQueue: jsonb("pitch_queue").$type<string[]>().notNull().default([]),
+  error: text("error"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+}).enableRLS();
+
+export type BrandScout = typeof brandScouts.$inferSelect;

@@ -5,14 +5,15 @@ process.on("unhandledRejection", (e) => console.error("Необроблена п
 
 if (process.env.DATABASE_URL) {
   try {
-    const [{ getDb }, { failInterruptedRuns }, search, scrape, outreach, backup, orders, pitch] = await Promise.all([
+    const [{ getDb }, { failInterruptedRuns }, search, scrape, outreach, backup, orders, pitch, brands] = await Promise.all([
       import("@/db/client"), import("@/collect"), import("@/search/pipeline"), import("@/scrape/jobs"), import("@/outreach/engine"), import("@/backup"),
-      import("@/orders"), import("@/pitch"),
+      import("@/orders"), import("@/pitch"), import("@/brands"),
     ]);
     await failInterruptedRuns(getDb());
     await search.requeueInterrupted(getDb());
     await scrape.requeueInterruptedJobs(getDb());
-    search.startSearchWorker(getDb, [scrape.runNextScrapeJob, outreach.runOutreach, orders.runOrders, pitch.runPitchQueue, backup.backupIfDue]);
+    await brands.requeueScouts(getDb());
+    search.startSearchWorker(getDb, [scrape.runNextScrapeJob, outreach.runOutreach, orders.runOrders, pitch.runPitchQueue, brands.runBrandScouts, backup.backupIfDue]);
   } catch (e) {
     console.error("Не вдалося запустити фонові задачі:", e);
   }
