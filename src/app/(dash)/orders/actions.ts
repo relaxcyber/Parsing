@@ -8,8 +8,9 @@ import { orders } from "@/db/schema";
 import { requireAuth } from "@/lib/auth";
 import { LlmUnavailableError } from "@/llm/client";
 import {
-  addClientMessage, createClientForOrder, createOrder, createOrderFromPitch, draftDelivery, markSent, restartOrderSearch, setNotes, startOrderSearch,
+  addClientMessage, createClientForOrder, createOrder, createOrderFromPitch, draftDelivery, markSent, restartOrderSearch, reviewNow, setNotes, startOrderSearch,
 } from "@/orders";
+import { setReviewVerdict } from "@/orders/review";
 import { lastProfile } from "@/pitch";
 
 const str = (form: FormData, k: string, max = 8000) => String(form.get(k) ?? "").trim().slice(0, max);
@@ -34,7 +35,7 @@ export async function createOrderAction(form: FormData) {
   const firstMessage = str(form, "firstMessage");
   if (firstMessage.length < 30) go("/orders", "Вставте повідомлення клієнта чи текст замовлення");
   const prev = await lastProfile(getDb());
-  const profile = { name: str(form, "name", 60) || prev?.name || "", about: str(form, "about", 600) || prev?.about || "", offer: str(form, "offer", 600) || prev?.offer || "" };
+  const profile = { name: str(form, "name", 60) || prev?.name || "", about: str(form, "about", 600) || prev?.about || "", offer: str(form, "offer", 600) || prev?.offer || "", style: prev?.style };
   if (!profile.name) go("/orders", "Вкажіть ваше ім’я для підпису");
   let id = 0;
   try {
@@ -125,4 +126,21 @@ export async function deleteOrderAction(form: FormData) {
   await requireAuth();
   await getDb().delete(orders).where(eq(orders.id, idOf(form)));
   go("/orders", "Замовлення видалено (пошуки лишились у «Пошуку креаторів»)");
+}
+
+export async function reviewNowAction(form: FormData) {
+  await requireAuth();
+  const id = idOf(form);
+  await run(`/orders/${id}`, async () => {
+    const r = await reviewNow(getDb(), id);
+    if (r.order.status === "searching") return "Підходящих не вистачило — запущено добір авторів";
+    return r.finished ? "Список перевірено, повідомлення з результатом готове" : "Перевірено частину — решту ІІ дочитає у фоні";
+  });
+}
+
+export async function verdictAction(form: FormData) {
+  await requireAuth();
+  const id = idOf(form);
+  await setReviewVerdict(getDb(), id, idOf(form, "creatorId"), z.enum(["fits", "no"]).parse(form.get("verdict")));
+  go(`/orders/${id}`);
 }

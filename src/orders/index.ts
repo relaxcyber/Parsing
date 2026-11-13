@@ -6,12 +6,14 @@ import {
   type Order, type OrderDraftKind, type OrderMessage, type OrderQuestion, type OrderSpec, type OrderStatus, type PitchProfile,
 } from "@/db/schema";
 import { detectLanguage } from "@/enrich/geo";
-import { chatJsonMeta, dataBlock, GUARD } from "@/llm/client";
+import { chatJsonMeta, dataBlock, GUARD, LlmUnavailableError } from "@/llm/client";
 import { quoteFound } from "@/llm/evidence";
+import { humanize, HUMAN_RULES, looksLikePhone, styleBlock, tellIssues } from "@/llm/human";
 import { AnswersSchema, checkAnswers, numTokens, type Answered } from "@/outreach/negotiate";
 import { DEFAULT_POLICY } from "@/outreach/policy";
-import { expandCounts } from "@/pitch";
+import { expandCounts, styleSamples } from "@/pitch";
 import { suggestFromBrief } from "@/search/brief";
+import { reviewStep } from "./review";
 
 /**
  * Замовлення: ви знаходите клієнта й пересилаєте його повідомлення, решту робить ІІ.
@@ -234,7 +236,7 @@ export type ResultFacts = { platform: string; found: number; with_email: number;
 
 export type DraftFacts = {
   kind: OrderDraftKind;
-  freelancer: PitchProfile;
+  freelancer: { name: string; about: string; offer: string };
   my_note: string | null;
   task: {
     brand: string | null; niche: string | null; platform: string | null; creators: number | null; countries: string[] | "any" | null;
@@ -248,16 +250,18 @@ export type DraftFacts = {
 const TASK: Record<OrderDraftKind, string> = {
   clarify: `First answer the client's questions using "answers" (if any). Then, if "ask" is not empty, ask those things as a short numbered list (one line each, phrased naturally). Do not start the work and do not promise dates.`,
   confirm: `Answer the client's questions using "answers" (if any). Restate the task from "task" in one or two sentences so the client can correct it, and say you are starting now. If "ask" is not empty, add them as optional preferences ("If you have a preference, ..."). Name a deadline only if task.deadline or my_note gives one.`,
-  deliver: `Tell the client the creator list is ready and attached as a spreadsheet. Use the numbers in "results" exactly (found = creators in the list, with_email = with a contact email). If found is less than task.creators, say so honestly and offer to extend the search. Ask for feedback.`,
+  deliver: `Tell the client the creator list is ready and attached as a spreadsheet. Use the numbers in "results" exactly (found = creators in the list, with_email = with a contact email). If found is less than task.creators, say so honestly and offer to extend the search. Ask them to take a look and say if anyone should be swapped. If task.contact_creators is not false and FACTS.freelancer.offer mentions contacting or negotiating with creators, offer that as the next step in one sentence.`,
+  nudge: `The client hasn't replied for a couple of days. Write a very short, friendly follow-up (one or two sentences): if "ask" is not empty, repeat the most important open question in plain words; otherwise ask if they had a chance to look. No pressure, no guilt, no "just following up".`,
 };
 
-const DRAFT_SYSTEM = (kind: OrderDraftKind) => `You write a short message from a freelancer to a client on a freelance platform, in simple clear English (B1 level). ${GUARD}
+const DRAFT_SYSTEM = (kind: OrderDraftKind) => `You write a short chat message from a freelancer to a client on a freelance platform, in simple clear English. ${GUARD}
 Task: ${TASK[kind]}
 Rules:
 - Use ONLY FACTS. Never invent prices, dates, numbers, links, guarantees, past clients or experience. my_note is the freelancer's own instruction (may be in Ukrainian): follow it and translate it.
 - Never write email addresses or phone numbers. No markdown headers, no emojis, no placeholders.
-- Under 150 words. Friendly and direct. Sign with FACTS.freelancer.name.
+- Under 150 words, usually much less. Don't open with "Hi, thanks for the details" every time: vary it, or just start with the point. End with just the name from FACTS.freelancer.name.
 - Say "creators", never "authors" or "bloggers".
+${HUMAN_RULES}
 Also return a full Ukrainian translation so the freelancer understands it.
 Return ONLY JSON: {"reply": "...", "translation_uk": "..."}`;
 
@@ -275,7 +279,7 @@ export function checkDraft(body: string, facts: DraftFacts, conversation: string
   for (const n of numTokens(noUrls)) if (!allowed.has(n)) issues.push(`число «${n}» відсутнє у фактах`);
   for (const u of new Set((body.match(URL_RE) ?? []).map((x) => x.replace(/[.,]+$/, "").toLowerCase()))) if (!allowedText.includes(u)) issues.push(`посилання ${u} відсутнє у фактах`);
   if (EMAIL.test(body)) issues.push("у тексті є email — на біржі до контракту контакти заборонені");
-  if (/\+?\d[\d\s()-]{8,}\d/.test(noUrls)) issues.push("у тексті схоже на номер телефону");
+  if (looksLikePhone(noUrls)) issues.push("у тексті схоже на номер телефону");
   if (/\{\{|\}\}|\[[A-Z _]+\]/.test(body)) issues.push("у тексті лишився шаблон");
   if (/\b(null|undefined|NaN)\b/.test(body)) issues.push("у тексті є службове слово null/undefined");
   const lang = detectLanguage(body).language;
@@ -288,25 +292,29 @@ export function checkDraft(body: string, facts: DraftFacts, conversation: string
   return [...new Set(issues)];
 }
 
-export async function writeDraft(db: Db, facts: DraftFacts, conversation: string): Promise<{ reply: string; translationUk: string; issues: string[] }> {
+export async function writeDraft(db: Db, facts: DraftFacts, conversation: string, style: string[] = []): Promise<{ reply: string; translationUk: string; issues: string[] }> {
   const messages = [
     { role: "system" as const, content: DRAFT_SYSTEM(facts.kind) },
-    { role: "user" as const, content: `FACTS (trusted):\n${JSON.stringify(facts, null, 1)}\n\n${dataBlock("conversation", conversation.slice(-6000))}` },
+    { role: "user" as const, content: `FACTS (trusted):\n${JSON.stringify(facts, null, 1)}\n${styleBlock(style)}\n${dataBlock("conversation", conversation.slice(-6000))}` },
   ];
+  const review = (raw: string) => {
+    const text = humanize(raw);
+    return { text, issues: [...checkDraft(text, facts, conversation), ...tellIssues(text)] };
+  };
   let res = await chatJsonMeta(db, DraftSchema, messages, { purpose: "order-reply", maxTokens: 900, cache: false });
-  let issues = checkDraft(res.data.reply, facts, conversation);
-  if (issues.length) {
+  let r = review(res.data.reply);
+  if (r.issues.length) {
     const retry = await chatJsonMeta(db, DraftSchema, [
       ...messages, { role: "assistant", content: JSON.stringify(res.data) },
-      { role: "user", content: `Fix these problems and return the full corrected JSON: ${issues.join("; ")}. Remove anything not in FACTS.` },
+      { role: "user", content: `Fix these problems and return the full corrected JSON: ${r.issues.join("; ")}. Remove anything not in FACTS. Keep it sounding like a real person.` },
     ], { purpose: "order-reply", maxTokens: 900, cache: false });
-    const again = checkDraft(retry.data.reply, facts, conversation);
-    if (again.length < issues.length) {
+    const again = review(retry.data.reply);
+    if (again.issues.length < r.issues.length) {
       res = retry;
-      issues = again;
+      r = again;
     }
   }
-  return { reply: res.data.reply.trim(), translationUk: res.data.translation_uk.trim(), issues };
+  return { reply: r.text, translationUk: res.data.translation_uk.trim(), issues: r.issues };
 }
 
 const followersText = (s: OrderSpec) =>
@@ -314,7 +322,7 @@ const followersText = (s: OrderSpec) =>
 
 export function draftFacts(o: Pick<Order, "profile" | "notes">, spec: OrderSpec, kind: OrderDraftKind, answers: Answered[], ask: FieldKey[], results?: ResultFacts): DraftFacts {
   return {
-    kind, freelancer: o.profile, my_note: o.notes?.trim() || null,
+    kind, freelancer: { name: o.profile.name, about: o.profile.about, offer: o.profile.offer }, my_note: o.notes?.trim() || null,
     task: {
       brand: spec.brand, niche: spec.niche, platform: spec.platform, creators: spec.count, countries: spec.countries, followers: followersText(spec),
       must_have: spec.mustHave, exclude: spec.exclude, deadline: spec.deadline, deliverable: spec.deliverable, contact_creators: spec.wantsOutreach,
@@ -323,6 +331,11 @@ export function draftFacts(o: Pick<Order, "profile" | "notes">, spec: OrderSpec,
     ask: ask.map((k) => ({ field: k, intent: FIELDS.find((f) => f.key === k)!.intent })),
     ...(results ? { results } : {}),
   };
+}
+
+/** Ваш стиль: зразки з профілю, відгуки, на які відповіли, і ваші власні (не з чернетки) повідомлення в цьому замовленні. */
+async function orderStyle(db: Db, o: Pick<Order, "profile">): Promise<string[]> {
+  return styleSamples(db, o.profile);
 }
 
 /* ---------- 4. обробка замовлення ---------- */
@@ -377,7 +390,7 @@ export async function processOrder(db: Db, id: number): Promise<Order> {
     return loadOrder(db, id);
   }
   const conv = conversationText(o.messages).transcript;
-  const d = await writeDraft(db, draftFacts(o, spec, kind, answered, ask), conv);
+  const d = await writeDraft(db, draftFacts(o, spec, kind, answered, ask), conv, await orderStyle(db, o));
   await save(db, id, { ...base, status, draft: d.reply, draftUk: d.translationUk, draftKind: kind, draftAsks: ask, draftIssues: d.issues });
   return loadOrder(db, id);
 }
@@ -507,8 +520,24 @@ export async function refreshOrder(db: Db, o: Order): Promise<Order> {
   if (o.status !== "searching" || !o.searchIds.length) return o;
   const rows = await db.select({ status: searches.status }).from(searches).where(inArray(searches.id, o.searchIds));
   if (rows.some((r) => r.status === "queued" || r.status === "running")) return o;
-  await save(db, o.id, { status: "results" });
-  return { ...o, status: "results" };
+  // Пошук завершено — далі перевірка списку (фоновий виконавець або кнопка «Перевірити зараз»).
+  await save(db, o.id, { status: "reviewing" });
+  return { ...o, status: "reviewing" };
+}
+
+/** Цифри для клієнта — з перевіреного списку (лише «підходить»). */
+export async function reviewedResults(db: Db, o: Order): Promise<ResultFacts> {
+  const fits = o.review.filter((r) => r.verdict === "fits");
+  if (!o.review.length) return orderResults(db, o.searchIds);
+  const cs = fits.length ? await db.select({ id: creators.id, emails: creators.emails }).from(creators).where(inArray(creators.id, fits.map((f) => f.creatorId))) : [];
+  const platforms = [...new Set(fits.map((f) => f.platform))];
+  return (platforms.length ? platforms : ["instagram"]).map((platform) => {
+    const list = fits.filter((f) => f.platform === platform);
+    return {
+      platform, found: list.length, leads: list.length,
+      with_email: list.filter((f) => (cs.find((c) => c.id === f.creatorId)?.emails.length ?? 0) > 0).length,
+    };
+  });
 }
 
 export async function orderResults(db: Db, searchIds: number[]): Promise<ResultFacts> {
@@ -529,8 +558,8 @@ export async function orderResults(db: Db, searchIds: number[]): Promise<ResultF
 export async function draftDelivery(db: Db, id: number): Promise<Order> {
   const o = await loadOrder(db, id);
   if (!o.spec) throw new Error("Немає завдання");
-  const results = await orderResults(db, o.searchIds);
-  const d = await writeDraft(db, draftFacts(o, o.spec, "deliver", [], [], results), conversationText(o.messages).transcript);
+  const results = await reviewedResults(db, o);
+  const d = await writeDraft(db, draftFacts(o, o.spec, "deliver", [], [], results), conversationText(o.messages).transcript, await orderStyle(db, o));
   await save(db, id, { draft: d.reply, draftUk: d.translationUk, draftKind: "deliver", draftAsks: [], draftIssues: d.issues });
   return loadOrder(db, id);
 }
@@ -551,3 +580,100 @@ export async function createClientForOrder(db: Db, id: number): Promise<number> 
 }
 
 export const isStale = (o: Order, now = Date.now()) => o.status === "clarifying" && now - o.updatedAt.getTime() > 3 * DAY;
+
+/* ---------- 5. автоматично: перевірка, добір, здача, нагадування ---------- */
+
+/** Підходящих не вистачило — один раз добираємо новим пошуком з іншими хештегами (якщо недорого). */
+export async function topUpSearch(db: Db, o: Order): Promise<number | null> {
+  const spec = o.spec;
+  if (!spec || o.topUps >= 1) return null;
+  const fits = o.review.filter((r) => r.verdict === "fits").length;
+  const short = (spec.count ?? 20) - fits;
+  if (short <= 0) return null;
+  const platform = spec.platform === "tiktok" ? "tiktok" : "instagram";
+  const budget = platform === "tiktok" ? 0 : Math.min(AUTO_START_USD, Math.max(3, Math.round(short * 0.3)));
+  const used = o.searchIds.length ? (await db.select({ hashtags: searches.hashtags }).from(searches).where(inArray(searches.id, o.searchIds))).flatMap((r) => r.hashtags) : [];
+  const s = await suggestFromBrief(db, `${briefOf(spec)}\nAlready searched these hashtags, suggest different ones: ${used.join(", ")}`, spec.focus);
+  const hashtags = s.hashtags.filter((h) => !used.includes(h));
+  if (platform === "instagram" && !hashtags.length && !s.bioQueries.length) return null;
+  const [row] = await db.insert(searches).values({
+    name: `Замовлення #${o.id}: добір`.slice(0, 80), platform, focus: spec.focus, brief: briefOf(spec).slice(0, 4000), brandName: spec.brand,
+    outreachLanguage: "en", hashtags, keywords: s.keywords, stopWords: s.stopWords,
+    sources: { bioQueries: s.bioQueries, competitors: s.competitors, seeds: [], places: [], webQueries: [], usernames: [] },
+    countries: spec.countries === "any" || !spec.countries ? [] : spec.countries, languages: spec.languages.length ? spec.languages : s.languages,
+    minFollowers: spec.followersMin, maxFollowers: spec.followersMax,
+    postsPerTag: 50, maxProfiles: Math.min(300, Math.max(40, short * 8)), auditLimit: Math.min(40, short + 10), deepLimit: 0, commentsLimit: 0,
+    targetLeads: short, budgetUsd: platform === "instagram" ? budget : null, clientId: o.clientId,
+  }).returning({ id: searches.id });
+  await save(db, o.id, { searchIds: [...o.searchIds, row.id], topUps: o.topUps + 1, status: "searching" });
+  return row.id;
+}
+
+/** Перевірку завершено: добір, якщо не вистачило, інакше — чернетка з результатом. */
+export async function finishReview(db: Db, id: number): Promise<Order> {
+  const o = await loadOrder(db, id);
+  if (await topUpSearch(db, o)) return loadOrder(db, id);
+  await save(db, id, { status: "results" });
+  return draftDelivery(db, id);
+}
+
+/** Перевірити список до кінця зараз (кнопка): зупиняється, якщо модель зайнята. */
+export async function reviewNow(db: Db, id: number): Promise<{ order: Order; finished: boolean }> {
+  for (let i = 0; i < 20; i++) {
+    const o = await loadOrder(db, id);
+    if (o.status !== "reviewing") return { order: o, finished: true };
+    const r = await reviewStep(db, o);
+    if (r.done) return { order: await finishReview(db, id), finished: true };
+  }
+  return { order: await loadOrder(db, id), finished: false };
+}
+
+const NUDGE_AFTER_MS = 2 * DAY;
+
+/** Чи час нагадати клієнту: останнє слово — ваше, понад 2 доби тиші, і ви ще не писали тричі поспіль. */
+export function needsNudge(o: Pick<Order, "status" | "draft" | "messages">, now = Date.now()): boolean {
+  if (!(o.status === "clarifying" || o.status === "ready" || o.status === "delivered") || o.draft) return false;
+  const last = o.messages[o.messages.length - 1];
+  if (!last || last.from !== "me" || now - new Date(last.at).getTime() < NUDGE_AFTER_MS) return false;
+  let mine = 0;
+  for (let i = o.messages.length - 1; i >= 0 && o.messages[i].from === "me"; i--) mine++;
+  return mine < 3;
+}
+
+export async function draftNudge(db: Db, id: number): Promise<Order> {
+  const o = await loadOrder(db, id);
+  const spec = o.spec;
+  if (!spec) return o;
+  const ask = orderState(spec, []).requiredMissing.slice(0, 1);
+  const d = await writeDraft(db, draftFacts(o, spec, "nudge", [], ask), conversationText(o.messages).transcript, await orderStyle(db, o));
+  await save(db, id, { draft: d.reply, draftUk: d.translationUk, draftKind: "nudge", draftAsks: [], draftIssues: d.issues });
+  return loadOrder(db, id);
+}
+
+const g = globalThis as unknown as { __ordersAt?: number };
+
+/** Крок фонового виконавця: стан пошуків, перевірка списку, здача, нагадування. Не частіше ніж раз на хвилину. */
+export async function runOrders(db: Db): Promise<boolean> {
+  if (Date.now() - (g.__ordersAt ?? 0) < 60_000) return false;
+  g.__ordersAt = Date.now();
+  try {
+    const active = await db.select().from(orders).where(inArray(orders.status, ["searching", "reviewing", "clarifying", "ready", "delivered"]));
+    for (const o of active.filter((x) => x.status === "searching")) await refreshOrder(db, o);
+    const [rev] = await db.select().from(orders).where(eq(orders.status, "reviewing")).orderBy(orders.updatedAt).limit(1);
+    if (rev) {
+      const r = await reviewStep(db, rev);
+      if (r.done) await finishReview(db, rev.id);
+      return true;
+    }
+    const nudge = active.find((o) => needsNudge(o));
+    if (nudge) {
+      await draftNudge(db, nudge.id);
+      return true;
+    }
+  } catch (e) {
+    if (!(e instanceof LlmUnavailableError)) console.error("Замовлення: фоновий крок не вдався:", e);
+  }
+  return false;
+}
+
+export const resetOrderTimers = () => (g.__ordersAt = 0);

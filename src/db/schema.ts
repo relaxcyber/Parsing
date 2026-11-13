@@ -685,7 +685,14 @@ export type JobAnalysis = {
 };
 
 /** Ваші дані для відгуку: модель не додає досвіду чи цифр понад те, що тут написано. */
-export type PitchProfile = { name: string; about: string; offer: string };
+export type PitchProfile = {
+  name: string; about: string; offer: string;
+  /** 2–3 ваші справжні повідомлення англійською: модель підлаштовує під них тон і простоту (фактів з них не бере). */
+  style?: string;
+};
+
+/** Як обробити відгук із черги (кілька замовлень вставлено разом). */
+export type PitchOptions = { platform: "auto" | "instagram" | "tiktok"; search: boolean };
 
 /** Автор-приклад у відгуку: без email — контакти віддаємо лише після замовлення. */
 export type PitchSample = {
@@ -705,6 +712,8 @@ export const jobPitches = pgTable("job_pitches", {
   issues: jsonb("issues").$type<string[]>().notNull().default([]),
   samples: jsonb("samples").$type<PitchSample[]>().notNull().default([]),
   searchId: integer("search_id").references(() => searches.id, { onDelete: "set null" }),
+  /** Відгук у черзі (кілька замовлень вставлено разом): фоновий виконавець розбере його, коли модель вільна. */
+  options: jsonb("options").$type<PitchOptions>(),
   /** Ви вже відправили відгук і чим закінчилось — для статистики відгуків. */
   status: text("status").$type<"draft" | "sent" | "replied" | "won" | "lost">().notNull().default("draft"),
   createdAt: ts("created_at").notNull().defaultNow(),
@@ -746,8 +755,19 @@ export type OrderSpec = {
 /** Питання клієнта, на яке ІІ не знайшов відповіді у ваших даних, — чекає вас. */
 export type OrderQuestion = { question: string; questionUk: string; quote: string };
 
-export type OrderStatus = "clarifying" | "needs_you" | "ready" | "searching" | "results" | "delivered" | "closed";
-export type OrderDraftKind = "clarify" | "confirm" | "deliver";
+export type OrderStatus = "clarifying" | "needs_you" | "ready" | "searching" | "reviewing" | "results" | "delivered" | "closed";
+export type OrderDraftKind = "clarify" | "confirm" | "deliver" | "nudge";
+
+/** Перевірка автора перед здачею: «підходить» іде клієнту, «сумнівно» — вам на рішення, «ні» — відсіяно. */
+export type ReviewItem = {
+  creatorId: number; handle: string; platform: string;
+  verdict: "fits" | "no" | "unsure";
+  /** Коротко англійською — у файл клієнту («чому підходить»). */
+  reason: string;
+  reasonUk: string;
+  quote: string | null;
+  by: "code" | "ai" | "you";
+};
 
 export const orders = pgTable("orders", {
   id: serial("id").primaryKey(),
@@ -769,6 +789,10 @@ export const orders = pgTable("orders", {
   draftAsks: jsonb("draft_asks").$type<string[]>().notNull().default([]),
   draftIssues: jsonb("draft_issues").$type<string[]>().notNull().default([]),
   searchIds: jsonb("search_ids").$type<number[]>().notNull().default([]),
+  /** Перевірка списку перед здачею. */
+  review: jsonb("review").$type<ReviewItem[]>().notNull().default([]),
+  /** Скільки разів пошук автоматично добирав авторів, коли підходящих не вистачило. */
+  topUps: integer("top_ups").notNull().default(0),
   status: text("status").$type<OrderStatus>().notNull().default("clarifying"),
   createdAt: ts("created_at").notNull().defaultNow(),
   updatedAt: ts("updated_at").notNull().defaultNow(),

@@ -4,6 +4,7 @@ import type { Db } from "@/db/client";
 import { detectLanguage } from "@/enrich/geo";
 import { chatJsonMeta, dataBlock, GUARD } from "@/llm/client";
 import { quoteFound } from "@/llm/evidence";
+import { aiTells, humanize, HUMAN_RULES } from "@/llm/human";
 import { SENDER } from "./draft";
 import { policyForAnswers, toUsd } from "./policy";
 
@@ -276,6 +277,8 @@ Rules:
 - Use ONLY facts from FACTS. Never invent amounts, dates, links, product details, promises or terms. The only amount you may name is plan.fee_usd (and the creator's own rate, if you refer to it).
 - Include every answer from plan.answers, in natural words, without adding anything.
 - Under 130 words. Warm, direct, first person plural ("we"). No subject line. Sign with ${SENDER}.
+${HUMAN_RULES}
+(If the language is not English, follow the same spirit: natural, how a person writes in that language.)
 Return ONLY JSON: {"body": "..."}`;
 
 const LANG: Record<string, string> = { en: "English", uk: "Ukrainian", ru: "Russian", pl: "Polish", de: "German", es: "Spanish" };
@@ -317,17 +320,22 @@ export async function writeReply(db: Db, facts: ReplyFacts, inbound: string, lan
     { role: "user" as const, content: `FACTS (trusted):\n${JSON.stringify({ ...facts, plan: planForModel }, null, 1)}\n\n${inbound ? dataBlock("creator_last_message", inbound.slice(0, 3000)) : ""}` },
   ];
   let res = await chatJsonMeta(db, ReplySchema, messages, { purpose: "outreach-reply", maxTokens: 700, cache: false });
-  let issues = checkReply(res.data.body, facts, inbound, language);
-  if (issues.length) {
+  let body = humanize(res.data.body);
+  let issues = checkReply(body, facts, inbound, language);
+  // ІІ-ознаки — привід переписати, але не помилка: відповідь автору не блокується через стиль.
+  const fix = [...issues, ...aiTells(body, language).map((t) => `sounds like AI: "${t}"`)];
+  if (fix.length) {
     const retry = await chatJsonMeta(db, ReplySchema, [
       ...messages, { role: "assistant", content: JSON.stringify(res.data) },
-      { role: "user", content: `Fix these problems and return the full corrected JSON: ${issues.join("; ")}. Remove anything not in FACTS.` },
+      { role: "user", content: `Fix these problems and return the full corrected JSON: ${fix.join("; ")}. Remove anything not in FACTS. Keep it sounding like a real person.` },
     ], { purpose: "outreach-reply", maxTokens: 700, cache: false });
-    const again = checkReply(retry.data.body, facts, inbound, language);
-    if (again.length < issues.length) {
+    const again = humanize(retry.data.body);
+    const againIssues = checkReply(again, facts, inbound, language);
+    if (againIssues.length < issues.length || (againIssues.length === issues.length && aiTells(again, language).length < aiTells(body, language).length)) {
       res = retry;
-      issues = again;
+      body = again;
+      issues = againIssues;
     }
   }
-  return { body: res.data.body.trim(), issues, model: res.model };
+  return { body, issues, model: res.model };
 }

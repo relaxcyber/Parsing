@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { creators, jobPitches, searchCandidates, searches } from "@/db/schema";
 import {
-  checkProposal, codeRedFlags, expandCounts, tidy, createPitch, groundJob, JobSchema, jobFit, proposalFacts, rewritePitch, sampleList, sampleWhy, shortCount,
+  checkProposal, codeRedFlags, expandCounts, queuePitches, runPitchQueue, splitJobs, tidy, createPitch, groundJob, JobSchema, jobFit, proposalFacts, rewritePitch, sampleList, sampleWhy, shortCount,
 } from "@/pitch";
 import { addTestKey, testDb } from "./helpers";
 
@@ -155,5 +155,25 @@ describe("job pitch end to end", () => {
     const [p] = await db.select().from(jobPitches).where(eq(jobPitches.id, id));
     expect(p.searchId).toBeNull();
     expect(jobFit(p.analysis!).level).toBe("skip");
+  });
+});
+
+describe("several jobs at once", () => {
+  it("splits by --- and the worker analyses them one by one; only good-fit jobs get a sample search", async () => {
+    const db = await testDb();
+    await addTestKey(db, "groq", "gq");
+    const calls: string[] = [];
+    fakeLlm(calls);
+    const second = "Looking for a UGC creator to film 3 TikTok videos for our coffee brand. Send your portfolio and rates please, thanks a lot.";
+    const jobs = splitJobs(`${JOB}\n---\n${second}\n===\ntoo short`);
+    expect(jobs).toHaveLength(2);
+    expect(await queuePitches(db, jobs, profile, { platform: "auto", search: true })).toBe(2);
+    expect(await runPitchQueue(db)).toBe(true);
+    const [first] = await db.select().from(jobPitches).orderBy(jobPitches.id).limit(1);
+    expect(first.analysis?.jobType).toBe("find_creators");
+    expect(first.searchId).not.toBeNull();
+    expect(first.proposal).toMatch(/^You need 30/);
+    expect(await runPitchQueue(db)).toBe(true);
+    expect(await runPitchQueue(db)).toBe(false);
   });
 });

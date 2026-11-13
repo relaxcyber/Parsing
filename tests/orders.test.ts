@@ -2,8 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { creators, orders, searchCandidates, searches, type OrderMessage } from "@/db/schema";
 import {
-  addClientMessage, checkDraft, createOrder, draftDelivery, draftFacts, groundSpec, markSent, orderState, refreshOrder, setNotes, SpecSchema,
+  addClientMessage, checkDraft, createOrder, draftFacts, groundSpec, markSent, needsNudge, orderState, refreshOrder, reviewNow, setNotes, SpecSchema,
 } from "@/orders";
+import { clientCsv, codeVerdict, setReviewVerdict } from "@/orders/review";
+import { aiTells, humanize, looksLikePhone } from "@/llm/human";
 import { addTestKey, testDb } from "./helpers";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -89,7 +91,15 @@ function fakeLlm(calls: string[]) {
       };
     } else if (system.startsWith("You help a creator-sourcing")) {
       calls.push("brief");
-      out = { hashtags: ["dogsoftiktok"], keywords: ["dog"], bio_queries: ["dog mom"], countries: ["GB"], languages: ["en"] };
+      // Для добору — інші хештеги (уже використані код теж відкидає).
+      out = { hashtags: user.includes("Already searched") ? ["dogsoftiktok", "dogtok"] : ["dogsoftiktok"], keywords: ["dog"], bio_queries: ["dog mom"], countries: ["GB"], languages: ["en"] };
+    } else if (system.startsWith("You check creators")) {
+      calls.push("review");
+      out = { creators: [
+        { handle: "dog1", verdict: "fits", reason_en: "posts dog care reels with her corgi", reason_uk: "ролики про догляд за коргі", quote: "daily dog care reels" },
+        { handle: "@dog2", verdict: "fits", reason_en: "two labradors, treat content", reason_uk: "два лабрадори", quote: "Two labradors" },
+        { handle: "dog3", verdict: "fits", reason_en: "has a dog", reason_uk: "має собаку", quote: "my golden retriever" },
+      ] };
     } else {
       const kind = /Task: Tell the client the creator list is ready/.test(system) ? "deliver" : /Restate the task/.test(system) ? "confirm" : "clarify";
       calls.push(kind);
@@ -139,17 +149,80 @@ describe("order end to end", () => {
     expect(s).toMatchObject({ platform: "tiktok", status: "queued", targetLeads: 25, minFollowers: 10000, maxFollowers: 100000, countries: ["GB"], hashtags: ["dogsoftiktok"] });
     expect(sent.order.status).toBe("searching");
 
-    // 5. Пошук готовий — чернетка з результатом із реальних чисел.
-    const made = await db.insert(creators).values([1, 2, 3].map((i) => ({ platform: "tiktok", username: `dog${i}`, emails: i < 3 ? [`d${i}@mail.com`] : [] }))).returning({ id: creators.id });
-    await db.insert(searchCandidates).values(made.map((c) => ({ searchId: s.id, creatorId: c.id, stage: "qualified" as const, score: 70, lead: true })));
+    // 5. Пошук готовий — ІІ перевіряє кожного автора: агентство відсіює правило, модель — без цитати не довіряємо.
+    const made = await db.insert(creators).values([
+      { platform: "tiktok", username: "dog1", bio: "Corgi mom, daily dog care reels", followers: 20000, emails: ["d1@mail.com"] },
+      { platform: "tiktok", username: "dog2", bio: "Two labradors and a lot of treats", followers: 50000, emails: ["d2@mail.com"] },
+      { platform: "tiktok", username: "dog3", bio: "life, coffee, travel", followers: 30000, emails: [] },
+      { platform: "tiktok", username: "dogtalentagency", bio: "We represent pet creators", followers: 40000, emails: ["a@agency.com"] },
+    ]).returning({ id: creators.id });
+    await db.insert(searchCandidates).values(made.map((c, i) => ({ searchId: s.id, creatorId: c.id, stage: "qualified" as const, score: 90 - i, lead: true })));
     await db.update(searches).set({ status: "done" }).where(eq(searches.id, s.id));
     const [row] = await db.select().from(orders).where(eq(orders.id, o.id));
-    expect((await refreshOrder(db, row)).status).toBe("results");
-    o = await draftDelivery(db, o.id);
+    expect((await refreshOrder(db, row)).status).toBe("reviewing");
+    let r = await reviewNow(db, o.id);
+    o = r.order;
+    expect(o.review.map((x) => [x.handle, x.verdict, x.by]).sort()).toEqual([
+      ["dog1", "fits", "ai"], ["dog2", "fits", "ai"], ["dog3", "unsure", "ai"], ["dogtalentagency", "no", "code"],
+    ]);
+    // Підходящих 2 з 25 — один раз автоматично добираємо новим пошуком з іншими хештегами.
+    expect(o.status).toBe("searching");
+    expect(o.topUps).toBe(1);
+    const [top] = await db.select().from(searches).where(eq(searches.id, o.searchIds[1]));
+    expect(top).toMatchObject({ platform: "tiktok", targetLeads: 23, hashtags: ["dogtok"] });
+    await db.update(searches).set({ status: "done" }).where(eq(searches.id, top.id));
+
+    // 6. Добір нічого не дав — вдруге не добираємо: здаємо, що є. Сумнівного автора ви схвалюєте самі.
+    await setReviewVerdict(db, o.id, made[2].id, "fits");
+    const [row2] = await db.select().from(orders).where(eq(orders.id, o.id));
+    expect((await refreshOrder(db, row2)).status).toBe("reviewing");
+    r = await reviewNow(db, o.id);
+    o = r.order;
+    expect(o.status).toBe("results");
     expect(o.draft).toBe("The list is ready: 3 creators, 2 with email. Yevhen");
     expect(o.draftIssues).toEqual([]);
+    const { csv, rows } = await clientCsv(db, o);
+    expect(rows).toBe(3);
+    expect(csv.replace(/^\uFEFF/, "").split(/\r?\n/)[0]).toBe("creator,platform,profile_url,followers,engagement_rate_pct,country,email,why_it_fits");
+    expect(csv).not.toMatch(/agency/);
+    expect(csv).toMatch(/\ndog1,TikTok,https:\/\/www\.tiktok\.com\/@dog1,20000,,,d1@mail\.com,posts dog care reels with her corgi/);
     expect((await markSent(db, o.id)).order.status).toBe("delivered");
     // Розбір тієї самої переписки після підказки береться з кешу — модель не викликається вдруге.
-    expect(calls).toEqual(["spec", "answer", "clarify", "spec", "answer", "answer", "confirm", "brief", "deliver"]);
+    expect(calls).toEqual(["spec", "answer", "clarify", "spec", "answer", "answer", "confirm", "brief", "review", "brief", "deliver"]);
+  });
+});
+
+describe("human-sounding text", () => {
+  it("finds AI tells and fixes the safe ones without changing the meaning", () => {
+    const t = "I hope this message finds you well.\nI'd be happy to help — I will leverage my tool to deliver a tailored list. Don't hesitate to reach out!";
+    expect(aiTells(t)).toEqual(expect.arrayContaining(["I hope this message finds you well", "I'd be happy to", "don't hesitate", "leverage", "tailored", "довге тире —"]));
+    expect(humanize(t)).toBe("I'd be happy to help - I will leverage my tool to deliver a tailored list.");
+    expect(aiTells("hey, saw your post. I can get you 30 creators by friday, want emails too?")).toEqual([]);
+  });
+  it("phone check needs 9+ digits, so handles and counts don't trip it", () => {
+    expect(looksLikePhone("@creator2 ( ) - 20K followers")).toBe(false);
+    expect(looksLikePhone("call me at +44 7700 900123")).toBe(true);
+  });
+});
+
+describe("list review rules and nudges", () => {
+  const spec = { followersMin: 10000, followersMax: 100000, countries: ["GB"] } as any;
+  const c = (x: Partial<Parameters<typeof codeVerdict>[0]>) => ({ creatorId: 1, handle: "anna", platform: "tiktok", displayName: null, bio: null, followers: 20000, country: null, businessCategory: null, isBusiness: null, captions: [], ...x });
+  it("code drops agencies, shops by bio, follower range and wrong country; borderline names go to the model", () => {
+    expect(codeVerdict(c({ handle: "petmgmt" }), spec)?.verdict).toBe("no");
+    expect(codeVerdict(c({ bio: "Free shipping on all orders, shop now" }), spec)?.verdict).toBe("no");
+    expect(codeVerdict(c({ followers: 5000 }), spec)?.reasonUk).toMatch(/замало/);
+    expect(codeVerdict(c({ followers: 9500 }), spec)).toBeNull(); // 10% запасу
+    expect(codeVerdict(c({ country: "US" }), spec)?.reasonUk).toMatch(/US/);
+    expect(codeVerdict(c({ handle: "anna_official" }), spec)).toBeNull();
+    expect(codeVerdict(c({ handle: "talentedanna" }), spec)).toBeNull();
+  });
+  it("nudges only after 2 days of silence and at most 3 of your messages in a row", () => {
+    const old = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    const base = { status: "clarifying" as const, draft: null };
+    expect(needsNudge({ ...base, messages: [{ from: "client", text: "hi", at: old }, { from: "me", text: "q?", at: old }] })).toBe(true);
+    expect(needsNudge({ ...base, messages: [{ from: "me", text: "q?", at: new Date().toISOString() }] })).toBe(false);
+    expect(needsNudge({ ...base, messages: [{ from: "me", text: "1", at: old }, { from: "me", text: "2", at: old }, { from: "me", text: "3", at: old }] })).toBe(false);
+    expect(needsNudge({ ...base, status: "searching" as any, messages: [{ from: "me", text: "q?", at: old }] })).toBe(false);
   });
 });

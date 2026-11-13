@@ -1,14 +1,15 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
 import type { Db } from "@/db/client";
 import {
   creators, jobPitches, searchCandidates, searches,
-  type JobAnalysis, type JobPitch, type PitchProfile, type PitchSample,
+  type JobAnalysis, type JobPitch, type PitchOptions, type PitchProfile, type PitchSample,
 } from "@/db/schema";
 import { detectLanguage } from "@/enrich/geo";
 import { profileUrl } from "@/lib/profile-url";
-import { chatJsonMeta, dataBlock, GUARD } from "@/llm/client";
+import { chatJsonMeta, dataBlock, GUARD, LlmUnavailableError } from "@/llm/client";
 import { quoteFound } from "@/llm/evidence";
+import { humanize, HUMAN_RULES, looksLikePhone, styleBlock, tellIssues } from "@/llm/human";
 import { numTokens } from "@/outreach/negotiate";
 import { suggestFromBrief } from "@/search/brief";
 
@@ -240,14 +241,15 @@ export function sampleList(samples: PitchSample[]): string {
 /* ---------- 3. відгук ---------- */
 
 export type ProposalFacts = {
-  freelancer: PitchProfile;
+  freelancer: { name: string; about: string; offer: string };
   job: { title: string; niche: string; platform: string; requirements: string[]; creators_needed: number | null; questions: string[] };
   samples: { handle: string; url: string; followers?: string; engagement?: string; country?: string; why?: string }[];
 };
 
 export function proposalFacts(a: JobAnalysis, profile: PitchProfile, samples: PitchSample[]): ProposalFacts {
   return {
-    freelancer: profile,
+    // Зразки стилю — не факти: числа й імена з них у відгук не потраплять.
+    freelancer: { name: profile.name, about: profile.about, offer: profile.offer },
     job: {
       title: a.title, niche: a.niche, platform: a.platform, requirements: a.requirements.map((r) => r.text),
       creators_needed: a.creatorsNeeded?.count ?? null, questions: a.questions,
@@ -261,21 +263,22 @@ export function proposalFacts(a: JobAnalysis, profile: PitchProfile, samples: Pi
 
 const ProposalSchema = z.object({ proposal: z.string(), translation_uk: z.string().catch("") });
 
-const PROPOSAL_SYSTEM = `You write a short freelance proposal (cover letter) in simple, clear English (B1 level) for a specialist who finds and vets social media creators for brands. ${GUARD}
-Structure:
-1. First sentence: restate the client's specific need from FACTS.job (no "I am excited", no "Dear Hiring Manager").
-2. Two or three sentences: how the freelancer will do it, using ONLY FACTS.freelancer.about and FACTS.freelancer.offer.
-3. If FACTS.samples is not empty: one line like "I already found a few creators in your niche:" and then one line per sample: "- @handle (url) — followers, engagement, why". Use the values exactly as given.
-4. Ask the questions from FACTS.job.questions (if any).
-5. Sign with FACTS.freelancer.name.
+const PROPOSAL_SYSTEM = `You write a short reply to a freelance job post, as the freelancer: someone who finds and vets social media creators for brands. Simple, clear English. ${GUARD}
+It should read like a quick personal note from a real person who actually read the post, not a template:
+- Open with the client's actual need in your own words (from FACTS.job), no greeting formula and no "Dear Hiring Manager".
+- Say briefly how you'd do it, using ONLY FACTS.freelancer.about and FACTS.freelancer.offer.
+- If FACTS.samples is not empty, mention you already looked and found a few creators, then one line per sample starting with "- ": "@handle (url) - followers, engagement, why". Use the values exactly as given.
+- If FACTS.job.questions has something, ask one (at most two) of them naturally.
+- End with just the name from FACTS.freelancer.name.
 Rules:
 - Never invent experience, past clients, results, reviews, years, prices or any number not in FACTS or the job post.
 - Follow the client's numbers: if FACTS.job.creators_needed is set, offer exactly that many creators, even if FACTS.freelancer.offer names another count.
 - Do not name a price: the platform shows the bid separately. Mention a rate only if the job post asks for it, and then only a price from FACTS.freelancer.offer.
-- Never write email addresses or phone numbers.
-- Under 170 words. Plain text, no markdown headers, no emojis.
-- Put a blank line between the parts, and each sample on its own line starting with "- ".
-Also return a full Ukrainian translation of the proposal so the freelancer understands it.
+- If the post asks to start the reply with a word or include a code word, do it.
+- Never write email addresses or phone numbers. No emojis.
+- 60-150 words. Blank line between paragraphs.
+${HUMAN_RULES}
+Also return a full Ukrainian translation so the freelancer understands it.
 Return ONLY JSON: {"proposal": "...", "translation_uk": "..."}`;
 
 const URL_RE = /https?:\/\/[^\s)>\]]+/gi;
@@ -296,7 +299,7 @@ export function checkProposal(body: string, facts: ProposalFacts, jobText: strin
   }
   if (EMAIL.test(body)) issues.push("у відгуку є email — контакти до замовлення не даємо (і Upwork це забороняє)");
   EMAIL.lastIndex = 0;
-  if (/\+?\d[\d\s()-]{8,}\d/.test(noUrls)) issues.push("у відгуку схоже на номер телефону");
+  if (looksLikePhone(noUrls)) issues.push("у відгуку схоже на номер телефону");
   if (/\{\{|\}\}/.test(body)) issues.push("у відгуку лишився шаблон {{…}}");
   if (/\b(null|undefined|NaN)\b/.test(body)) issues.push("у відгуку є службове слово null/undefined");
   const lang = detectLanguage(body).language;
@@ -312,25 +315,38 @@ export function checkProposal(body: string, facts: ProposalFacts, jobText: strin
 /** Модель інколи зливає все в один абзац: кожен приклад — з нового рядка. */
 export const tidy = (body: string) => body.replace(/\r\n/g, "\n").replace(/[ \t]+- (?=@)/g, "\n- ").replace(/\n{3,}/g, "\n\n").trim();
 
-export async function writeProposal(db: Db, facts: ProposalFacts, jobText: string): Promise<{ proposal: string; translationUk: string; issues: string[] }> {
+export async function writeProposal(db: Db, facts: ProposalFacts, jobText: string, style: string[] = []): Promise<{ proposal: string; translationUk: string; issues: string[] }> {
   const messages = [
     { role: "system" as const, content: PROPOSAL_SYSTEM },
-    { role: "user" as const, content: `FACTS (trusted):\n${JSON.stringify(facts, null, 1)}\n\n${dataBlock("job_post", jobText.slice(0, 4000))}` },
+    { role: "user" as const, content: `FACTS (trusted):\n${JSON.stringify(facts, null, 1)}\n${styleBlock(style)}\n${dataBlock("job_post", jobText.slice(0, 4000))}` },
   ];
+  // Безпечні виправлення (тире, порожні фрази) — одразу; решту ІІ-ознак і помилок модель виправляє сама один раз.
+  const review = (raw: string) => {
+    const text = humanize(tidy(raw));
+    return { text, issues: [...checkProposal(text, facts, jobText), ...tellIssues(text)] };
+  };
   let res = await chatJsonMeta(db, ProposalSchema, messages, { purpose: "pitch-proposal", maxTokens: 900, cache: false });
-  let issues = checkProposal(res.data.proposal, facts, jobText);
-  if (issues.length) {
+  let r = review(res.data.proposal);
+  if (r.issues.length) {
     const retry = await chatJsonMeta(db, ProposalSchema, [
       ...messages, { role: "assistant", content: JSON.stringify(res.data) },
-      { role: "user", content: `Fix these problems and return the full corrected JSON: ${issues.join("; ")}. Remove anything not in FACTS.` },
+      { role: "user", content: `Fix these problems and return the full corrected JSON: ${r.issues.join("; ")}. Remove anything not in FACTS. Keep it sounding like a real person.` },
     ], { purpose: "pitch-proposal", maxTokens: 900, cache: false });
-    const again = checkProposal(retry.data.proposal, facts, jobText);
-    if (again.length < issues.length) {
+    const again = review(retry.data.proposal);
+    if (again.issues.length < r.issues.length) {
       res = retry;
-      issues = again;
+      r = again;
     }
   }
-  return { proposal: tidy(res.data.proposal), translationUk: res.data.translation_uk.trim(), issues };
+  return { proposal: r.text, translationUk: res.data.translation_uk.trim(), issues: r.issues };
+}
+
+/** Ваші зразки + відгуки, на які замовники відповіли: так тон з часом підлаштовується під те, що працює. */
+export async function styleSamples(db: Db, profile: PitchProfile): Promise<string[]> {
+  const own = (profile.style ?? "").split(/\n\s*-{3,}\s*\n/).map((x) => x.trim()).filter((x) => x.length > 20);
+  const won = await db.select({ proposal: jobPitches.proposal }).from(jobPitches)
+    .where(inArray(jobPitches.status, ["replied", "won"])).orderBy(desc(jobPitches.updatedAt)).limit(2);
+  return [...own.slice(0, 3), ...won.map((w) => w.proposal ?? "").filter(Boolean)].slice(0, 4);
 }
 
 /* ---------- усе разом ---------- */
@@ -369,7 +385,7 @@ export async function createPitch(db: Db, input: PitchInput): Promise<{ id: numb
       notes.push(`Пошук прикладів не створено: ${(e instanceof Error ? e.message : String(e)).slice(0, 160)}`);
     }
   }
-  const w = await writeProposal(db, proposalFacts(a, input.profile, []), jobText);
+  const w = await writeProposal(db, proposalFacts(a, input.profile, []), jobText, await styleSamples(db, input.profile));
   const [row] = await db.insert(jobPitches).values({
     title: a.title, jobText, profile: input.profile, analysis: a, proposal: w.proposal, proposalUk: w.translationUk, issues: w.issues, searchId,
   }).returning({ id: jobPitches.id });
@@ -385,10 +401,52 @@ export async function rewritePitch(db: Db, pitch: JobPitch, creatorIds: number[]
     samples = (creatorIds ? opts.filter((o) => creatorIds.includes(o.creatorId)) : opts).slice(0, SAMPLE_COUNT)
       .map(({ score: _s, lead: _l, ...s }) => s);
   }
-  const w = await writeProposal(db, proposalFacts(pitch.analysis, pitch.profile, samples), pitch.jobText);
+  const w = await writeProposal(db, proposalFacts(pitch.analysis, pitch.profile, samples), pitch.jobText, await styleSamples(db, pitch.profile));
   await db.update(jobPitches).set({ proposal: w.proposal, proposalUk: w.translationUk, issues: w.issues, samples, updatedAt: new Date() })
     .where(eq(jobPitches.id, pitch.id));
   return { issues: w.issues, samples: samples.length };
+}
+
+/* ---------- кілька замовлень разом ---------- */
+
+/** Розділювач між замовленнями у вставленому тексті: рядок з ---, === або ***. */
+export function splitJobs(text: string): string[] {
+  return text.split(/\n\s*(?:-{3,}|={3,}|\*{3,})\s*\n/).map((x) => x.trim()).filter((x) => x.length >= 80).slice(0, 20);
+}
+
+/** Кілька замовлень — у чергу: розбирає фоновий виконавець по одному, коли модель вільна (ліміти безкоштовних ключів). */
+export async function queuePitches(db: Db, texts: string[], profile: PitchProfile, options: PitchOptions): Promise<number> {
+  if (!texts.length) return 0;
+  await db.insert(jobPitches).values(texts.map((t) => ({
+    title: t.split("\n")[0].trim().slice(0, 80) || "Замовлення", jobText: t.slice(0, 8000), profile, options,
+  })));
+  return texts.length;
+}
+
+/** Крок фонового виконавця: наступний відгук із черги. Пошук прикладів — лише для тих, за які варто братися. */
+export async function runPitchQueue(db: Db): Promise<boolean> {
+  const [p] = await db.select().from(jobPitches).where(and(isNull(jobPitches.analysis), isNotNull(jobPitches.options))).orderBy(asc(jobPitches.id)).limit(1);
+  if (!p) return false;
+  const opts = p.options ?? { platform: "auto", search: true };
+  let a: JobAnalysis;
+  try {
+    a = await analyzeJob(db, p.jobText);
+  } catch (e) {
+    // Модель зайнята — спробуємо наступного разу; інша помилка — знімаємо з черги, щоб не блокувала решту.
+    if (e instanceof LlmUnavailableError) return false;
+    await db.update(jobPitches).set({ options: null, issues: [`Не вдалося розібрати: ${(e instanceof Error ? e.message : String(e)).slice(0, 160)}`] }).where(eq(jobPitches.id, p.id));
+    return true;
+  }
+  let searchId: number | null = null;
+  if (opts.search && jobFit(a).level === "good") {
+    const platform = opts.platform !== "auto" ? opts.platform : a.platform === "tiktok" ? "tiktok" : "instagram";
+    searchId = (await createSampleSearch(db, a, p.jobText, platform).catch(() => ({ id: null }))).id;
+  }
+  const w = await writeProposal(db, proposalFacts(a, p.profile, []), p.jobText, await styleSamples(db, p.profile));
+  await db.update(jobPitches).set({
+    title: a.title, analysis: a, proposal: w.proposal, proposalUk: w.translationUk, issues: w.issues, searchId, updatedAt: new Date(),
+  }).where(eq(jobPitches.id, p.id));
+  return true;
 }
 
 /** Ваші дані з останнього відгуку — щоб не вводити їх щоразу. */

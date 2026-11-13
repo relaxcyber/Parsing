@@ -5,6 +5,7 @@ export const ORDER_STATUS: Record<OrderStatus, { label: string; next: string; cl
   needs_you: { label: "потрібні ви", next: "Клієнт питає те, чого ІІ не знає: напишіть підказку", cls: "risk-high" },
   ready: { label: "завдання зрозуміле", next: "Надішліть підтвердження клієнту — пошук запуститься сам", cls: "risk-low" },
   searching: { label: "шукаємо", next: "Пошук іде — сторінка оновиться сама" },
+  reviewing: { label: "перевіряємо список", next: "ІІ перевіряє кожного автора перед здачею — сторінка оновиться сама" },
   results: { label: "результат готовий", next: "Напишіть повідомлення з результатом і прикладіть CSV", cls: "risk-low" },
   delivered: { label: "здано", next: "Попросіть у клієнта відгук і запропонуйте наступний етап" },
   closed: { label: "закрито", next: "" },

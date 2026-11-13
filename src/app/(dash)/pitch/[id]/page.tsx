@@ -38,6 +38,13 @@ export default async function PitchDetail({ params, searchParams }: { params: Pr
         {" · "}стан: <b>{PITCH_STATUS[p.status]}</b>
       </p>
       {msg && <div className="flash" role="status">{msg}</div>}
+      {!a && p.options && (
+        <>
+          <AutoRefresh everyMs={10000} />
+          <div className="flash">У черзі на розбір: ІІ візьме це замовлення, щойно модель звільниться. Сторінка оновиться сама.</div>
+        </>
+      )}
+      {!a && !p.options && p.issues.length > 0 && <div className="flash risk-high">{p.issues.join("; ")}</div>}
 
       {a && (
         <section className="card">

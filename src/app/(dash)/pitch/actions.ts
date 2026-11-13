@@ -7,7 +7,7 @@ import { getDb } from "@/db/client";
 import { jobPitches, type JobPitch } from "@/db/schema";
 import { requireAuth } from "@/lib/auth";
 import { LlmUnavailableError } from "@/llm/client";
-import { checkProposal, createPitch, proposalFacts, rewritePitch } from "@/pitch";
+import { checkProposal, createPitch, proposalFacts, queuePitches, rewritePitch, splitJobs } from "@/pitch";
 
 const go = (path: string, msg: string) => redirect(`${path}?msg=${encodeURIComponent(msg)}`);
 const str = (form: FormData, k: string, max = 2000) => String(form.get(k) ?? "").trim().slice(0, max);
@@ -23,15 +23,21 @@ async function load(id: number): Promise<JobPitch> {
 
 export async function createPitchAction(form: FormData) {
   await requireAuth();
-  const jobText = str(form, "jobText", 8000);
-  const profile = { name: str(form, "name", 60), about: str(form, "about", 600), offer: str(form, "offer", 600) };
+  const jobText = str(form, "jobText", 60000);
+  const profile = { name: str(form, "name", 60), about: str(form, "about", 600), offer: str(form, "offer", 600), style: str(form, "style", 4000) || undefined };
   if (jobText.length < 80) go("/pitch", "Вставте повний текст замовлення (хоча б кілька речень)");
   if (!profile.name || !profile.offer) go("/pitch", "Вкажіть ваше ім’я і що саме пропонуєте");
   const platform = z.enum(["auto", "instagram", "tiktok"]).catch("auto").parse(form.get("platform"));
+  // Кілька замовлень, розділених рядком ---: у чергу, фоновий виконавець розбере по одному.
+  const jobs = splitJobs(jobText);
+  if (jobs.length > 1) {
+    const n = await queuePitches(getDb(), jobs, profile, { platform, search: form.get("search") === "on" });
+    go("/pitch", `У черзі ${n} замовлень: ІІ розбере їх по одному у фоні (з безкоштовним ключем — близько хвилини на кожне). Приклади шукаються лише для тих, за які варто братися`);
+  }
   let id: number;
   let notes: string[];
   try {
-    ({ id, notes } = await createPitch(getDb(), { jobText, profile, platform, search: form.get("search") === "on" }));
+    ({ id, notes } = await createPitch(getDb(), { jobText: jobText.slice(0, 8000), profile, platform, search: form.get("search") === "on" }));
   } catch (e) {
     return go("/pitch", errText(e));
   }

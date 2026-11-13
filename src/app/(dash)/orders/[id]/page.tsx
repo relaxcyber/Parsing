@@ -9,8 +9,10 @@ import { ConfirmButton } from "../../keys/confirm-button";
 import { AutoRefresh } from "../../search/auto-refresh";
 import { STATUS } from "../../search/labels";
 import {
-  clientMessageAction, deleteOrderAction, deliveryAction, notesAction, orderStatusAction, outreachClientAction, sentAction, startSearchAction,
+  clientMessageAction, deleteOrderAction, deliveryAction, notesAction, orderStatusAction, outreachClientAction, reviewNowAction, sentAction, startSearchAction,
+  verdictAction,
 } from "../actions";
+import { profileUrl } from "@/lib/profile-url";
 import { ORDER_STATUS } from "../labels";
 
 const df = new Intl.DateTimeFormat("uk-UA", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
@@ -43,7 +45,10 @@ export default async function OrderPage({ params, searchParams }: { params: Prom
   const state = orderState(spec, o.asked);
   const runs = o.searchIds.length ? await db.select().from(searches).where(inArray(searches.id, o.searchIds)) : [];
   const results = o.searchIds.length ? await orderResults(db, o.searchIds) : [];
-  const searching = runs.some((s) => s.status === "queued" || s.status === "running");
+  const searching = runs.some((s) => s.status === "queued" || s.status === "running") || o.status === "reviewing";
+  const fits = o.review.filter((r) => r.verdict === "fits");
+  const unsure = o.review.filter((r) => r.verdict === "unsure");
+  const rejected = o.review.filter((r) => r.verdict === "no");
   const lastClient = [...o.messages].reverse().find((m) => m.from === "client");
 
   return (
@@ -67,7 +72,7 @@ export default async function OrderPage({ params, searchParams }: { params: Prom
 
       {o.draft && (
         <section className="card">
-          <h2>Відповідь клієнту{o.draftKind === "confirm" ? ": підтвердження й старт" : o.draftKind === "deliver" ? ": результат" : ""}</h2>
+          <h2>Відповідь клієнту{o.draftKind === "confirm" ? ": підтвердження й старт" : o.draftKind === "deliver" ? ": результат" : o.draftKind === "nudge" ? ": нагадування (клієнт мовчить 2+ дні)" : ""}</h2>
           {o.draftIssues.length > 0 && <div className="flash risk-high">Перевірка: {o.draftIssues.join("; ")}. Виправте текст перед відправкою.</div>}
           <form action={sentAction} className="search-form">
             <input type="hidden" name="id" value={o.id} />
@@ -90,8 +95,8 @@ export default async function OrderPage({ params, searchParams }: { params: Prom
                 : "Після «Надіслав» пошук запуститься сам."}
             </p>
           )}
-          {o.draftKind === "deliver" && runs.length > 0 && (
-            <p className="muted">Прикладіть файл: {runs.map((s) => <a key={s.id} href={`/search/${s.id}/export`} style={{ marginRight: 8 }}>CSV {s.platform === "tiktok" ? "TikTok" : "Instagram"}</a>)}</p>
+          {o.draftKind === "deliver" && (
+            <p className="muted">Прикладіть файл: <a href={`/orders/${o.id}/export`}><b>CSV для клієнта ({fits.length} перевірених авторів)</b></a></p>
           )}
         </section>
       )}
@@ -182,13 +187,72 @@ export default async function OrderPage({ params, searchParams }: { params: Prom
               })}
             </tbody>
           </table>
+          {o.review.length > 0 && (
+            <>
+              <h3>Перевірка перед здачею</h3>
+              <p>
+                Підходять: <b className="risk-low">{fits.length}</b>{o.spec?.count ? ` з ${o.spec.count} потрібних` : ""} · сумнівні (вирішіть ви): <b className={unsure.length ? "risk-medium" : ""}>{unsure.length}</b> · відсіяно: {rejected.length}
+                {o.topUps > 0 && " · пошук уже раз добирав авторів"}
+                {" · "}<a href={`/orders/${o.id}/export`}>CSV для клієнта</a>
+              </p>
+              {unsure.length > 0 && (
+                <table>
+                  <thead><tr><th>Сумнівний автор</th><th>Чому</th><th></th></tr></thead>
+                  <tbody>
+                    {unsure.map((r) => (
+                      <tr key={r.creatorId}>
+                        <td><a href={profileUrl(r.platform, r.handle)} target="_blank" rel="noreferrer">@{r.handle}</a> <Link href={`/creators/${r.creatorId}`} className="muted">картка</Link></td>
+                        <td className="muted">{r.reasonUk}</td>
+                        <td>
+                          <div className="inline">
+                            {(["fits", "no"] as const).map((v) => (
+                              <form key={v} action={verdictAction}>
+                                <input type="hidden" name="id" value={o.id} /><input type="hidden" name="creatorId" value={r.creatorId} /><input type="hidden" name="verdict" value={v} />
+                                <button className="chip">{v === "fits" ? "Підходить" : "Ні"}</button>
+                              </form>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <details>
+                <summary>Хто йде клієнту ({fits.length}) і кого відсіяно ({rejected.length})</summary>
+                <table>
+                  <tbody>
+                    {[...fits, ...rejected].map((r) => (
+                      <tr key={r.creatorId}>
+                        <td><a href={profileUrl(r.platform, r.handle)} target="_blank" rel="noreferrer">@{r.handle}</a></td>
+                        <td className={r.verdict === "fits" ? "risk-low" : "muted"}>{r.verdict === "fits" ? "клієнту" : "відсіяно"}{r.by === "you" ? " (ви)" : r.by === "code" ? " (правило)" : ""}</td>
+                        <td className="muted">{r.verdict === "fits" ? r.reason : r.reasonUk}{r.quote ? ` («${r.quote}»)` : ""}</td>
+                        <td>
+                          <form action={verdictAction}>
+                            <input type="hidden" name="id" value={o.id} /><input type="hidden" name="creatorId" value={r.creatorId} /><input type="hidden" name="verdict" value={r.verdict === "fits" ? "no" : "fits"} />
+                            <button className="chip">{r.verdict === "fits" ? "Прибрати" : "Повернути"}</button>
+                          </form>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
+            </>
+          )}
+          {o.status === "reviewing" && (
+            <form action={reviewNowAction} style={{ marginTop: 12 }}>
+              <input type="hidden" name="id" value={o.id} />
+              <button className="chip">Перевірити список зараз</button>
+            </form>
+          )}
           {(o.status === "results" || o.status === "delivered") && (
             <form action={deliveryAction} style={{ marginTop: 12 }}>
               <input type="hidden" name="id" value={o.id} />
               <button className="primary">Написати повідомлення з результатом</button>
             </form>
           )}
-          <p className="muted">Перед відправкою відкрийте CSV і гляньте 5–10 авторів: прибрати невдалих швидше, ніж пояснювати клієнту.</p>
+          <p className="muted">ІІ сам перевіряє кожного автора перед здачею: клієнту йдуть лише «підходить». Від вас — рішення щодо сумнівних (якщо є).</p>
         </section>
       )}
 

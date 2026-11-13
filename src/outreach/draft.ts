@@ -8,6 +8,7 @@ import type { ProfileAnalysis } from "@/analysis/profile";
 import type { Db } from "@/db/client";
 import { contentItems, creators, outreachDrafts, searches, type Creator, type Search } from "@/db/schema";
 import { detectLanguage } from "@/enrich/geo";
+import { aiTells, humanize, HUMAN_RULES } from "@/llm/human";
 import { chatJsonMeta, dataBlock, GUARD } from "@/llm/client";
 
 /**
@@ -109,6 +110,8 @@ Rules:
 - Write on behalf of the brand team in the first person plural ("we"), so that no verb or adjective reveals the sender's gender.
 - Email: under 120 words, one clear question at the end. DM: under 60 words. Follow-ups: short, polite, add no new claims.
 - If an EXAMPLE is given, match its tone and length, but never copy facts from it.
+${HUMAN_RULES}
+(If the language is not English, follow the same spirit: natural, how a person writes in that language.)
 Return ONLY JSON: {"subject_a": "...", "subject_b": "... (a different angle)", "email": "...", "dm": "...", "followup_1": "... (after 3-4 days)", "followup_2": "... (after a week, last one)"}`;
 
 export type DraftOverrides = {
@@ -135,17 +138,23 @@ export async function generateDraft(
   ].filter(Boolean).join("\n\n");
 
   const messages = [{ role: "system" as const, content: SYSTEM(language) }, { role: "user" as const, content: user }];
-  let res = await chatJsonMeta(db, DraftSchema, messages, { purpose: "outreach-draft", maxTokens: 1200, cache: false });
+  // Тире й порожні фрази виправляємо самі; інші ІІ-ознаки — привід переписати, але не помилка (лист не блокується).
+  const clean = (d: Draft): Draft => ({ ...d, email: humanize(d.email), dm: humanize(d.dm), followup_1: humanize(d.followup_1), followup_2: humanize(d.followup_2) });
+  const tells = (d: Draft) => [...new Set([d.email, d.dm, d.followup_1, d.followup_2].flatMap((t) => aiTells(t, language)))].map((t) => `sounds like AI: "${t}"`);
+  let res = await chatJsonMeta(db, DraftSchema, messages, { purpose: "outreach-draft", maxTokens: 950, cache: false });
+  res = { ...res, data: clean(res.data) };
   let issues = checkDraft(res.data, facts, language);
-  if (issues.length) {
+  const fix = [...issues, ...tells(res.data)];
+  if (fix.length) {
     const retry = await chatJsonMeta(db, DraftSchema, [
       ...messages,
       { role: "assistant", content: JSON.stringify(res.data) },
-      { role: "user", content: `Fix these problems and return the full corrected JSON: ${issues.join("; ")}. Remove anything not supported by FACTS.` },
-    ], { purpose: "outreach-draft", maxTokens: 1200, cache: false });
-    const again = checkDraft(retry.data, facts, language);
-    if (again.length < issues.length) {
-      res = retry;
+      { role: "user", content: `Fix these problems and return the full corrected JSON: ${fix.join("; ")}. Remove anything not supported by FACTS. Keep it sounding like a real person.` },
+    ], { purpose: "outreach-draft", maxTokens: 950, cache: false });
+    const data = clean(retry.data);
+    const again = checkDraft(data, facts, language);
+    if (again.length < issues.length || (again.length === issues.length && tells(data).length < tells(res.data).length)) {
+      res = { ...retry, data };
       issues = again;
     }
   }

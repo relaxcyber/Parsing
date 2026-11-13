@@ -39,8 +39,8 @@ export default async function PitchPage({ searchParams }: { searchParams: Promis
       <section className="card">
         <h2>Новий відгук</h2>
         <form action={createPitchAction} className="search-form">
-          <label className="wide">Текст замовлення (скопіюйте повністю, разом з бюджетом)
-            <textarea name="jobText" rows={10} required minLength={80} maxLength={8000} placeholder="We are looking for someone to find 30 UGC creators for our skincare brand…" />
+          <label className="wide">Текст замовлення (скопіюйте повністю, разом з бюджетом). Кілька замовлень одразу — розділіть рядком ---
+            <textarea name="jobText" rows={10} required minLength={80} maxLength={60000} placeholder="We are looking for someone to find 30 UGC creators for our skincare brand…" />
           </label>
           <fieldset>
             <legend>Про вас: модель не додасть досвіду чи цифр, яких тут немає</legend>
@@ -57,6 +57,10 @@ export default async function PitchPage({ searchParams }: { searchParams: Promis
               <label><span><input type="checkbox" name="search" defaultChecked /> Одразу шукати 5 авторів-прикладів</span></label>
             </div>
             <label className="wide">Хто ви й як працюєте (англійською)<textarea name="about" rows={3} maxLength={600} defaultValue={profile?.about ?? DEFAULT_ABOUT} /></label>
+            <label className="wide">
+              Ваш стиль (необов’язково): 2–3 ваші справжні повідомлення англійською, розділені рядком ---. ІІ писатиме схоже на вас, а не «як ІІ»
+              <textarea name="style" rows={4} maxLength={4000} defaultValue={profile?.style ?? ""} placeholder={"hey! saw your post about the candle launch, love the packaging\n---\nsure, can do it by friday. want me to add emails too?"} />
+            </label>
             <label className="wide">Що пропонуєте: результат і строк (англійською). Кількість авторів ІІ візьме із замовлення; ціну у відгуку не пише, бо ставку на Upwork вводять окремо<textarea name="offer" rows={3} required maxLength={600} defaultValue={profile?.offer ?? DEFAULT_OFFER} /></label>
           </fieldset>
           <button className="primary">Розібрати й написати відгук</button>
@@ -84,7 +88,7 @@ export default async function PitchPage({ searchParams }: { searchParams: Promis
                     <td><Link href={`/pitch/${p.id}`}>{p.title}</Link></td>
                     <td>{fit && <span className={fit.cls}>{fit.label}</span>}</td>
                     <td>{b ? `$${b.amount}${b.kind === "hourly" ? "/год" : ""}` : "—"}</td>
-                    <td>{p.samples.length ? `${p.samples.length} у відгуку` : searchStatus ? STATUS[searchStatus].label.toLowerCase() : "—"}</td>
+                    <td>{!p.analysis && p.options ? "у черзі на розбір" : p.samples.length ? `${p.samples.length} у відгуку` : searchStatus ? STATUS[searchStatus].label.toLowerCase() : "—"}</td>
                     <td>{PITCH_STATUS[p.status]}</td>
                     <td className="muted">{df.format(p.createdAt)}</td>
                   </tr>

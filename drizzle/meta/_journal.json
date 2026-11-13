@@ -85,6 +85,13 @@
       "when": 1794556343510,
       "tag": "0011_bright_young_avengers",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794559059203,
+      "tag": "0012_rich_lockheed",
+      "breakpoints": true
     }
   ]
 }
