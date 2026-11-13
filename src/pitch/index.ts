@@ -317,13 +317,13 @@ export async function writeProposal(db: Db, facts: ProposalFacts, jobText: strin
     { role: "system" as const, content: PROPOSAL_SYSTEM },
     { role: "user" as const, content: `FACTS (trusted):\n${JSON.stringify(facts, null, 1)}\n\n${dataBlock("job_post", jobText.slice(0, 4000))}` },
   ];
-  let res = await chatJsonMeta(db, ProposalSchema, messages, { purpose: "pitch-proposal", maxTokens: 1200, cache: false });
+  let res = await chatJsonMeta(db, ProposalSchema, messages, { purpose: "pitch-proposal", maxTokens: 900, cache: false });
   let issues = checkProposal(res.data.proposal, facts, jobText);
   if (issues.length) {
     const retry = await chatJsonMeta(db, ProposalSchema, [
       ...messages, { role: "assistant", content: JSON.stringify(res.data) },
       { role: "user", content: `Fix these problems and return the full corrected JSON: ${issues.join("; ")}. Remove anything not in FACTS.` },
-    ], { purpose: "pitch-proposal", maxTokens: 1200, cache: false });
+    ], { purpose: "pitch-proposal", maxTokens: 900, cache: false });
     const again = checkProposal(retry.data.proposal, facts, jobText);
     if (again.length < issues.length) {
       res = retry;

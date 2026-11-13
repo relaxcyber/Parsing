@@ -78,6 +78,13 @@
       "when": 1794554719023,
       "tag": "0010_famous_tempest",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1794556343510,
+      "tag": "0011_bright_young_avengers",
+      "breakpoints": true
     }
   ]
 }

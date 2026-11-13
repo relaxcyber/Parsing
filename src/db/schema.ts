@@ -712,3 +712,66 @@ export const jobPitches = pgTable("job_pitches", {
 }).enableRLS();
 
 export type JobPitch = typeof jobPitches.$inferSelect;
+
+/* ---------- Замовлення: переписка з клієнтом → завдання на пошук ---------- */
+
+export type OrderMessage = { from: "client" | "me"; text: string; at: string };
+
+/** Завдання на пошук, зібране з переписки. Кожне значення клієнта — з дослівною цитатою (quotes[поле]). */
+export type OrderSpec = {
+  summaryUk: string;
+  /** Останнє повідомлення клієнта українською. */
+  lastMessageUk: string;
+  brand: string | null;
+  niche: string | null;
+  website: string | null;
+  platform: "instagram" | "tiktok" | "both" | null;
+  focus: "ugc" | "affiliate";
+  count: number | null;
+  /** "any" — клієнт сказав, що країна не важлива. */
+  countries: string[] | "any" | null;
+  languages: string[];
+  followersMin: number | null;
+  followersMax: number | null;
+  mustHave: string[];
+  exclude: string[];
+  deadline: string | null;
+  deliverable: string | null;
+  wantsOutreach: boolean | null;
+  budget: { amount: number; kind: "fixed" | "hourly" | "unknown" } | null;
+  quotes: Record<string, string>;
+  dropped: number;
+};
+
+/** Питання клієнта, на яке ІІ не знайшов відповіді у ваших даних, — чекає вас. */
+export type OrderQuestion = { question: string; questionUk: string; quote: string };
+
+export type OrderStatus = "clarifying" | "needs_you" | "ready" | "searching" | "results" | "delivered" | "closed";
+export type OrderDraftKind = "clarify" | "confirm" | "deliver";
+
+export const orders = pgTable("orders", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  pitchId: integer("pitch_id").references(() => jobPitches.id, { onDelete: "set null" }),
+  clientId: integer("client_id").references(() => clients.id, { onDelete: "set null" }),
+  profile: jsonb("profile").$type<PitchProfile>().notNull(),
+  messages: jsonb("messages").$type<OrderMessage[]>().notNull().default([]),
+  spec: jsonb("spec").$type<OrderSpec>(),
+  /** Про які поля вже питали клієнта: необов’язкові вдруге не питаємо, а беремо типові. */
+  asked: jsonb("asked").$type<string[]>().notNull().default([]),
+  /** Ваші підказки для відповіді (можна українською): ціна, строк, що завгодно. */
+  notes: text("notes"),
+  pending: jsonb("pending").$type<OrderQuestion[]>().notNull().default([]),
+  draft: text("draft"),
+  draftUk: text("draft_uk"),
+  draftKind: text("draft_kind").$type<OrderDraftKind>(),
+  /** Які поля питає чернетка: після «Надіслав» вони вважаються запитаними. */
+  draftAsks: jsonb("draft_asks").$type<string[]>().notNull().default([]),
+  draftIssues: jsonb("draft_issues").$type<string[]>().notNull().default([]),
+  searchIds: jsonb("search_ids").$type<number[]>().notNull().default([]),
+  status: text("status").$type<OrderStatus>().notNull().default("clarifying"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+}).enableRLS();
+
+export type Order = typeof orders.$inferSelect;

@@ -8,6 +8,7 @@ import { CopyButton } from "../../creators/print-button";
 import { ConfirmButton } from "../../keys/confirm-button";
 import { AutoRefresh } from "../../search/auto-refresh";
 import { STATUS } from "../../search/labels";
+import { fromPitchAction } from "../../orders/actions";
 import { deletePitchAction, pitchStatusAction, rewriteAction, saveProposalAction } from "../actions";
 import { FIT, JOB_TYPE, PITCH_STATUS } from "../labels";
 
@@ -99,6 +100,11 @@ export default async function PitchDetail({ params, searchParams }: { params: Pr
             </form>
           ))}
         </div>
+        <form action={fromPitchAction} style={{ marginTop: 12 }}>
+          <input type="hidden" name="pitchId" value={p.id} />
+          <button className="primary">Клієнт відповів → вести замовлення</button>
+        </form>
+        <p className="muted">Далі ви лише пересилаєте повідомлення клієнта: ІІ збере завдання, спитає, чого бракує, і запустить пошук.</p>
       </section>
 
       <section className="card">
