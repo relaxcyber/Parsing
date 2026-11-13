@@ -1,11 +1,10 @@
-import { and, asc, eq, inArray, lt, or, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
-import { detectAd } from "@/analysis/ads";
 import { mergePosts, postFactsFromRaw, profilePosts, type PostFacts } from "@/analysis/posts";
-import { collect, collectProfiles } from "@/collect";
+import { AlreadyRunningError, collect, collectProfiles } from "@/collect";
 import { fetchLocalHtml, isChallenge } from "@/collect/local";
 import type { Db } from "@/db/client";
-import { brandScouts, contentItems, type BrandCollab, type BrandCreator, type BrandLead, type BrandScout, type BrandScoutStats, type BrandVerdict } from "@/db/schema";
+import { brandAccounts, brandScouts, contentItems, type BrandAccount, type BrandCollab, type BrandCreator, type BrandLead, type BrandScout, type BrandScoutStats, type BrandVerdict } from "@/db/schema";
 import { checkEmail, usable } from "@/enrich/email";
 import { detectLanguage } from "@/enrich/geo";
 import { LINK_HUB } from "@/enrich/links";
@@ -16,6 +15,9 @@ import { suggestFromBrief } from "@/search/brief";
 import { toCsv } from "@/search/csv";
 import { extractEmails } from "@/search/signals";
 import { PRICE } from "@/search/sources";
+import { AGENCY, asCollabRows, brandMetrics, collectCollabs, distinctCreators, metricsFor, sizeFits, PERSON_CATEGORY, rankCollabs, ratesText, saveCollabs, sizeText, type BrandMetrics, type CreatorPosts } from "./collabs";
+
+export * from "./collabs";
 
 /**
  * Бренди для креаторів: хто вже платить авторам у ніші.
@@ -34,18 +36,6 @@ export function estimateScoutUsd(s: { tags: number; postsPerTag: number; maxCrea
   return Math.round((s.tags * s.postsPerTag + s.maxCreators + s.maxBrands) * ITEM_USD * 100) / 100;
 }
 
-const HANDLE = /^[a-z0-9._]{2,30}$/;
-/** Платформи й сервіси, які відмічають у дописах, але писати їм як бренду безглуздо. */
-const NOT_BRANDS = new Set([
-  "instagram", "creators", "tiktok", "youtube", "facebook", "meta", "threads", "reels", "explore", "linktree", "amazon", "amazonfashion",
-  "amazoninfluencer", "ltk.it", "shopltk", "liketoknow.it", "shopmy", "ugc", "ugccreator", "ugccreators", "canva", "capcut", "later", "collabstr",
-]);
-/** Категорії профілю, за якими це людина, а не бренд. */
-const PERSON_CATEGORY = /(creator|blogger|\bblog\b|public figure|artist|photographer|videographer|musician|band|athlete|influencer|model|gamer|comedian|writer|author|personal|actor|actress|dancer|journalist|coach|trainer|chef|host|editor|stylist)/i;
-/** Агентства й площадки співпраць: їхні спільні дописи з авторами — не реклама бренду. */
-export const AGENCY = /(agency|agencia|agence|mgmt|management|talents?(?!ed)|publicidad|marketing|influencers?(?=[._]|$)|collabs?(?=[._]|$)|\bpr\b|ugcagency|creatorhub)/i;
-/** Імена на кшталт «sora.rojasugc» чи «ugc_bylily» — автори, а не бренди. */
-const CREATOR_HANDLE = /ugc|creates|creator|influenc/i;
 const SOCIAL = /(^|\.)(instagram|tiktok|youtube|facebook|twitter|x|threads|pinterest|snapchat|wa|whatsapp|t)\.(com|me|net)$/;
 
 const hostOf = (url: string | null) => {
@@ -76,39 +66,6 @@ export function brandVerdict(raw: any): { verdict: BrandVerdict; why: string } {
     return { verdict: "brand", why: "власний сайт і магазинні слова в біо" };
   }
   return { verdict: "unsure", why: "категорії бізнесу немає: перевірте вручну" };
-}
-
-export type CreatorPosts = { creator: string; followers: number | null; posts: PostFacts[] };
-
-/** Бренди з рекламних дописів: бренд → докази (кожен допис один раз). Відмітки інших авторів вибірки — не бренди. */
-export function collectCollabs(creators: CreatorPosts[], skip: Set<string> = new Set()): { collabs: Map<string, BrandCollab[]>; adPosts: number } {
-  const collabs = new Map<string, BrandCollab[]>();
-  let adPosts = 0;
-  for (const c of creators) {
-    for (const p of c.posts) {
-      const ad = detectAd(p, c.creator);
-      if (!ad) continue;
-      adPosts++;
-      for (const raw of ad.brands) {
-        const b = raw.toLowerCase().replace(/^@/, "").replace(/[.]+$/, "");
-        if (!HANDLE.test(b) || b === c.creator || skip.has(b) || NOT_BRANDS.has(b) || CREATOR_HANDLE.test(b)) continue;
-        const list = collabs.get(b) ?? [];
-        if (!list.some((x) => x.postUrl === p.url)) {
-          list.push({ creator: c.creator, followers: c.followers, postUrl: p.url, reason: ad.reason, paid: p.paid === true, at: p.publishedAt?.toISOString() ?? null });
-        }
-        collabs.set(b, list);
-      }
-    }
-  }
-  return { collabs, adPosts };
-}
-
-const distinctCreators = (cs: BrandCollab[]) => new Set(cs.map((c) => c.creator)).size;
-
-/** Спершу бренди, з якими працювало більше різних авторів і з позначкою «Платне партнерство». */
-export function rankCollabs(collabs: Map<string, BrandCollab[]>): [string, BrandCollab[]][] {
-  const score = (cs: BrandCollab[]) => distinctCreators(cs) * 3 + cs.filter((c) => c.paid).length * 2 + cs.length;
-  return [...collabs.entries()].sort((a, b) => score(b[1]) - score(a[1]) || a[0].localeCompare(b[0]));
 }
 
 const BAD_EMAIL = /^(no-?reply|donotreply|do-not-reply|privacy|abuse|postmaster|webmaster|example|test|email|your|name)@|@(sentry|wixpress|example|domain|email|sentry-next|mysite)\.|\.(png|jpe?g|gif|webp|svg)$/i;
@@ -179,6 +136,59 @@ export const sortLeads = (leads: BrandLead[]) =>
   [...leads].sort((a, b) => verdictOrder[a.verdict] - verdictOrder[b.verdict] || Number(!!b.email) - Number(!!a.email)
     || distinctCreators(b.collabs) - distinctCreators(a.collabs) || b.collabs.length - a.collabs.length);
 
+/** Бренд з сирого профілю Instagram: поля, вердикт коду, email з біо. */
+export function leadFromProfile(handle: string, raw: any, collabs: BrandCollab[]): BrandLead {
+  const v = brandVerdict(raw);
+  const website = str(raw.externalUrl);
+  const bioEmail = pickEmail(extractEmails(str(raw.biography)), website);
+  return {
+    handle, name: str(raw.fullName), bio: str(raw.biography)?.slice(0, 400) ?? null, category: str(raw.businessCategoryName),
+    followers: typeof raw.followersCount === "number" ? raw.followersCount : null, website,
+    email: bioEmail, emailSource: bioEmail ? "біо Instagram" : null, verdict: v.verdict, verdictWhy: v.why, collabs,
+  };
+}
+
+/** Email на сайтах (бренди й сумнівні без email у біо) і перевірка домену на наявність пошти. */
+async function findEmails(leads: BrandLead[], resolveMx?: Resolver, progress?: (i: number, n: number) => Promise<unknown>): Promise<void> {
+  const toVisit = leads.filter((l) => l.verdict !== "not_brand" && !l.email && isRealSite(l.website));
+  for (const [i, l] of toVisit.entries()) {
+    if (progress && i % 5 === 0) await progress(i, toVisit.length);
+    const found = await siteEmail(l.website!).catch(() => null);
+    if (found) {
+      l.email = found.email;
+      l.emailSource = found.url;
+    }
+  }
+  // Адреси без поштового сервера не залишаємо: лист однаково повернеться.
+  for (const l of leads.filter((x) => x.email)) {
+    if (!usable(await checkEmail(l.email!, resolveMx))) {
+      l.email = null;
+      l.emailSource = null;
+    }
+  }
+}
+
+/** Перевірені профілі — у базу брендів (ваш власний вердикт не перезаписуємо). */
+async function saveAccounts(db: Db, leads: BrandLead[], platform = "instagram"): Promise<void> {
+  if (!leads.length) return;
+  const existing = await db.select().from(brandAccounts).where(and(eq(brandAccounts.platform, platform), inArray(brandAccounts.handle, leads.map((l) => l.handle))));
+  const now = new Date();
+  for (const l of leads) {
+    const prev = existing.find((e) => e.handle === l.handle);
+    const fields = {
+      name: l.name, bio: l.bio, category: l.category, followers: l.followers, website: l.website, email: l.email ?? prev?.email ?? null,
+      emailSource: l.email ? l.emailSource : prev?.emailSource ?? null, checkedAt: now, verifyRequestedAt: null, updatedAt: now,
+      ...(prev?.byYou ? {} : { verdict: l.verdict, verdictWhy: l.verdictWhy }),
+    };
+    if (prev) await db.update(brandAccounts).set(fields).where(eq(brandAccounts.id, prev.id));
+    else await db.insert(brandAccounts).values({ platform, handle: l.handle, ...fields }).onConflictDoNothing();
+    if (prev?.byYou) {
+      l.verdict = prev.verdict ?? l.verdict;
+      l.verdictWhy = prev.verdictWhy ?? l.verdictWhy;
+    }
+  }
+}
+
 /** Повний прохід: хештеги → автори → реклама → профілі брендів → email. */
 export async function runScout(db: Db, scout: BrandScout, opts: { resolveMx?: Resolver } = {}): Promise<void> {
   const stats: BrandScoutStats = { posts: 0, creators: 0, adPosts: 0, candidates: 0, brandProfiles: 0, withEmail: 0, costUsd: 0, notes: [] };
@@ -226,6 +236,7 @@ export async function runScout(db: Db, scout: BrandScout, opts: { resolveMx?: Re
 
   // 3. Реклама й бренди в ній.
   const { collabs, adPosts } = collectCollabs(creatorPosts, new Set(creatorPosts.map((c) => c.creator)));
+  await saveCollabs(db, collabs, { scoutId: scout.id });
   stats.adPosts = adPosts;
   stats.candidates = collabs.size;
   const top = rankCollabs(collabs).slice(0, scout.maxBrands);
@@ -243,34 +254,12 @@ export async function runScout(db: Db, scout: BrandScout, opts: { resolveMx?: Re
     const raw = profiles.get(handle);
     if (!raw) continue; // профілю немає (видалено чи перейменовано)
     stats.brandProfiles++;
-    const v = brandVerdict(raw);
-    const website = str(raw.externalUrl);
-    const bioEmail = pickEmail(extractEmails(str(raw.biography)), website);
-    leads.push({
-      handle, name: str(raw.fullName), bio: str(raw.biography)?.slice(0, 400) ?? null, category: str(raw.businessCategoryName),
-      followers: typeof raw.followersCount === "number" ? raw.followersCount : null, website,
-      email: bioEmail, emailSource: bioEmail ? "біо Instagram" : null, verdict: v.verdict, verdictWhy: v.why, collabs: cs.slice(0, 10),
-    });
+    leads.push(leadFromProfile(handle, raw, cs.slice(0, 10)));
   }
 
   // 5. Email на сайтах (лише бренди й сумнівні, без email у біо).
-  const toVisit = leads.filter((l) => l.verdict !== "not_brand" && !l.email && isRealSite(l.website));
-  for (const [i, l] of toVisit.entries()) {
-    if (i % 5 === 0) await stage(`Шукаю email на сайтах брендів (${i} з ${toVisit.length})`);
-    const found = await siteEmail(l.website!).catch(() => null);
-    if (found) {
-      l.email = found.email;
-      l.emailSource = found.url;
-    }
-  }
-  // Адреси без поштового сервера не залишаємо: лист однаково повернеться.
-  for (const l of leads.filter((x) => x.email)) {
-    const check = await checkEmail(l.email!, opts.resolveMx);
-    if (!usable(check)) {
-      l.email = null;
-      l.emailSource = null;
-    }
-  }
+  await findEmails(leads, opts.resolveMx, (i, n) => stage(`Шукаю email на сайтах брендів (${i} з ${n})`));
+  await saveAccounts(db, leads);
   stats.withEmail = leads.filter((l) => l.email && l.verdict !== "not_brand").length;
   stats.costUsd = Math.round(stats.costUsd * 1000) / 1000;
   await db.update(brandScouts).set({ status: "done", stage: null, stats, brands: sortLeads(leads), updatedAt: new Date() }).where(eq(brandScouts.id, scout.id));
@@ -394,7 +383,13 @@ export async function queuePitches(db: Db, s: BrandScout): Promise<number> {
   return handles.length;
 }
 
+export async function setAccountVerdict(db: Db, handle: string, verdict: BrandVerdict, platform = "instagram"): Promise<void> {
+  await db.update(brandAccounts).set({ verdict, byYou: true, verdictWhy: verdict === "brand" ? "ви позначили як бренд" : "ви позначили: не бренд", updatedAt: new Date() })
+    .where(and(eq(brandAccounts.platform, platform), eq(brandAccounts.handle, handle)));
+}
+
 export async function setBrandVerdict(db: Db, id: number, handle: string, verdict: BrandVerdict): Promise<void> {
+  await setAccountVerdict(db, handle, verdict);
   await saveLead(db, id, handle, (l) => ({ ...l, verdict, byYou: true, verdictWhy: verdict === "brand" ? "ви позначили як бренд" : verdict === "not_brand" ? "ви позначили: не бренд" : l.verdictWhy }));
 }
 
@@ -432,18 +427,109 @@ export async function runBrandScouts(db: Db): Promise<boolean> {
   return true;
 }
 
-/** Файл для креатора: бренди (без «не бренд»), контакти, докази співпраці й готовий лист. */
-export function brandsCsv(s: BrandScout): { csv: string; rows: number } {
-  const head = ["brand", "instagram", "name", "category", "followers", "website", "email", "creators_worked_with", "example_creators", "example_post", "last_collab", "paid_partnership", "email_subject", "email_body"];
-  const rows = s.brands.filter((l) => l.verdict !== "not_brand").map((l) => {
-    const last = l.collabs.map((c) => c.at).filter((x): x is string => !!x).sort().at(-1);
-    return [
-      l.handle, `https://www.instagram.com/${l.handle}/`, l.name ?? "", l.category ?? "", l.followers ?? "", l.website ?? "", l.email ?? "",
-      distinctCreators(l.collabs), [...new Set(l.collabs.map((c) => c.creator))].slice(0, 3).join(", "), l.collabs[0]?.postUrl ?? "",
-      last ? last.slice(0, 10) : "", l.collabs.some((c) => c.paid) ? "yes" : "", l.pitch?.subject ?? "", l.pitch?.body ?? "",
-    ];
-  });
-  return { csv: toCsv(head, rows), rows: rows.length };
+/* ---------- Цифри, база брендів, файли ---------- */
+
+/** Цифри брендів пошуку: з усієї бази доказів (з часом їх більше), а якщо бренду там немає — з доказів самого пошуку. */
+export async function scoutMetrics(db: Db, s: BrandScout, platform = "instagram"): Promise<Map<string, BrandMetrics>> {
+  const handles = s.brands.map((l) => l.handle);
+  const accounts = handles.length
+    ? await db.select({ id: brandAccounts.id, handle: brandAccounts.handle }).from(brandAccounts).where(and(eq(brandAccounts.platform, platform), inArray(brandAccounts.handle, handles)))
+    : [];
+  const byId = await metricsFor(db, accounts.map((a) => a.id));
+  const out = new Map<string, BrandMetrics>();
+  for (const l of s.brands) {
+    const id = accounts.find((a) => a.handle === l.handle)?.id;
+    const m = id != null ? byId.get(id) : undefined;
+    out.set(l.handle, m && m.posts >= l.collabs.length ? m : brandMetrics(asCollabRows(l.collabs)));
+  }
+  return out;
 }
 
-export { distinctCreators };
+export type BrandRow = {
+  handle: string; name: string | null; category: string | null; followers: number | null; website: string | null; email: string | null;
+  m: BrandMetrics; pitch?: BrandLead["pitch"];
+};
+
+const CSV_HEAD = [
+  "brand", "instagram", "name", "category", "brand_followers", "website", "email",
+  "creators_worked_with", "creators_last_90_days", "repeat_creators", "sponsored_posts", "paid_partnership_posts", "last_collab",
+  "creator_size", "sponsored_post_er_pct", "creator_ugc_rates_usd", "example_creators", "example_post", "email_subject", "email_body",
+];
+
+/** Файл для креатора: бренд, контакти й цифри співпраці з авторами (усе з публічних дописів). */
+export function rowsCsv(rows: BrandRow[]): { csv: string; rows: number } {
+  const data = rows.map((r) => [
+    r.handle, `https://www.instagram.com/${r.handle}/`, r.name ?? "", r.category ?? "", r.followers ?? "", r.website ?? "", r.email ?? "",
+    r.m.creators, r.m.active90, r.m.repeatCreators, r.m.posts, r.m.paidPosts, r.m.lastAt?.slice(0, 10) ?? "",
+    sizeText(r.m), r.m.adEr ?? "", ratesText(r.m), r.m.examples.map((e) => e.creator).join(", "), r.m.examples[0]?.postUrl ?? "",
+    r.pitch?.subject ?? "", r.pitch?.body ?? "",
+  ]);
+  return { csv: toCsv(CSV_HEAD, data), rows: data.length };
+}
+
+export function scoutRows(s: BrandScout, metrics: Map<string, BrandMetrics>): BrandRow[] {
+  return s.brands.filter((l) => l.verdict !== "not_brand").map((l) => ({
+    handle: l.handle, name: l.name, category: l.category, followers: l.followers, website: l.website, email: l.email,
+    m: metrics.get(l.handle) ?? brandMetrics(asCollabRows(l.collabs)), pitch: l.pitch,
+  }));
+}
+
+export type BaseFilter = { q?: string; size?: number | null; min?: number; show?: "checked" | "unchecked" | "all"; emailOnly?: boolean };
+export type BaseRow = { a: BrandAccount; m: BrandMetrics };
+
+/** База брендів з усіх пошуків: фільтри й порядок «хто зараз активно працює з авторами». */
+export async function brandBase(db: Db, f: BaseFilter = {}, platform = "instagram"): Promise<BaseRow[]> {
+  const show = f.show ?? "all";
+  const accounts = await db.select().from(brandAccounts).where(eq(brandAccounts.platform, platform));
+  const visible = accounts.filter((a) => a.verdict !== "not_brand" && (show === "all" || (show === "checked" ? a.checkedAt != null : a.checkedAt == null)));
+  const metrics = await metricsFor(db, visible.map((a) => a.id));
+  const q = f.q?.trim().toLowerCase();
+  return visible
+    .map((a) => ({ a, m: metrics.get(a.id)! }))
+    .filter(({ a, m }) => m.creators >= (f.min ?? 1)
+      && (!q || [a.handle, a.name, a.bio, a.category].some((x) => x?.toLowerCase().includes(q)))
+      && (!f.size || sizeFits(m, f.size))
+      && (!f.emailOnly || !!a.email))
+    .sort((x, y) => y.m.active90 - x.m.active90 || y.m.creators - x.m.creators || y.m.paidPosts - x.m.paidPosts || y.m.posts - x.m.posts)
+    .slice(0, 500);
+}
+
+export const baseRows = (rows: BaseRow[]): BrandRow[] =>
+  rows.map(({ a, m }) => ({ handle: a.handle, name: a.name, category: a.category, followers: a.followers, website: a.website, email: a.email, m }));
+
+export const VERIFY_BATCH = 40;
+
+/** Попросити перевірити профілі (платно, ≈ $0.0026 за профіль): виконавець бере їх пачками. */
+export async function requestVerify(db: Db, ids: number[]): Promise<number> {
+  if (!ids.length) return 0;
+  const r = await db.update(brandAccounts).set({ verifyRequestedAt: new Date() })
+    .where(and(inArray(brandAccounts.id, ids), isNull(brandAccounts.checkedAt))).returning({ id: brandAccounts.id });
+  return r.length;
+}
+
+/** Крок виконавця: пачка профілів брендів → вердикт коду, поля профілю, email з біо й сайту. */
+export async function runBrandVerify(db: Db, opts: { resolveMx?: Resolver } = {}): Promise<boolean> {
+  const rows = await db.select().from(brandAccounts).where(and(isNotNull(brandAccounts.verifyRequestedAt), isNull(brandAccounts.checkedAt)))
+    .orderBy(asc(brandAccounts.verifyRequestedAt)).limit(VERIFY_BATCH);
+  if (!rows.length) return false;
+  let collected;
+  try {
+    ({ batch: collected } = await collectProfiles(db, rows.map((r) => r.handle)));
+  } catch (e) {
+    if (e instanceof AlreadyRunningError) return false;
+    const msg = `не вдалося перевірити: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`;
+    await db.update(brandAccounts).set({ verifyRequestedAt: null, verdictWhy: msg, updatedAt: new Date() }).where(inArray(brandAccounts.id, rows.map((r) => r.id)));
+    return true;
+  }
+  const profiles = new Map<string, any>();
+  for (const c of collected.collected) if (c.item.kind === "profile" && c.raw) profiles.set(String((c.raw as any).username).toLowerCase(), c.raw);
+  const missing = rows.filter((r) => !profiles.has(r.handle));
+  if (missing.length) {
+    await db.update(brandAccounts).set({ verdict: "not_brand", verdictWhy: "профіль не знайдено", checkedAt: new Date(), verifyRequestedAt: null, updatedAt: new Date() })
+      .where(inArray(brandAccounts.id, missing.map((r) => r.id)));
+  }
+  const leads = rows.filter((r) => profiles.has(r.handle)).map((r) => leadFromProfile(r.handle, profiles.get(r.handle), []));
+  await findEmails(leads, opts.resolveMx);
+  await saveAccounts(db, leads);
+  return true;
+}

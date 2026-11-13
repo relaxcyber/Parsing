@@ -13,7 +13,7 @@ if (process.env.DATABASE_URL) {
     await search.requeueInterrupted(getDb());
     await scrape.requeueInterruptedJobs(getDb());
     await brands.requeueScouts(getDb());
-    search.startSearchWorker(getDb, [scrape.runNextScrapeJob, outreach.runOutreach, orders.runOrders, pitch.runPitchQueue, brands.runBrandScouts, backup.backupIfDue]);
+    search.startSearchWorker(getDb, [scrape.runNextScrapeJob, outreach.runOutreach, orders.runOrders, pitch.runPitchQueue, brands.runBrandScouts, brands.runBrandVerify, backup.backupIfDue]);
   } catch (e) {
     console.error("Не вдалося запустити фонові задачі:", e);
   }

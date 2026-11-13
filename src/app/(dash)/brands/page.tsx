@@ -26,6 +26,10 @@ export default async function BrandsPage({ searchParams }: { searchParams: Promi
         який можна продати креатору або віддати як бонус.
       </p>
       {msg && <div className="flash" role="status">{msg}</div>}
+      <p>
+        <Link href="/brands/base"><b>База брендів →</b></Link>{" "}
+        <span className="muted">усі бренди з реклами авторів з цифрами співпраці; кожен пошук креаторів поповнює її безкоштовно</span>
+      </p>
 
       <section className="card">
         <h2>Новий пошук брендів</h2>

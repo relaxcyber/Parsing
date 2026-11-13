@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { and, eq, gte, inArray, isNotNull, sql } from "drizzle-orm";
 import { analyzeAds, adsReasons, type AdsReport } from "@/analysis/ads";
+import { recordCreatorAds } from "@/brands/collabs";
 import { analyzeComments, commentMetrics } from "@/analysis/comments";
 import { mergePosts, postFactsFromRaw, postMetrics, profilePosts, type CommentFacts, type PostFacts } from "@/analysis/posts";
 import { analyzeProfile, profileVerdict, PROFILE_PROMPT_VERSION, type ProfileAnalysis } from "@/analysis/profile";
@@ -451,6 +452,8 @@ async function evaluate(ctx: Ctx, names: string[]): Promise<void> {
     if (s.blocked) row.reject.push("відсіяно стоп-словом");
     if (row.reject.length) continue;
     row.ads = row.posts.length ? analyzeAds(row.posts, c.username, sourcesOf(search).competitors) : (c.ads as AdsReport | null);
+    // Попутно: бренди з реклами автора — у базу брендів (дописи вже зібрані, тож безкоштовно).
+    if (search.platform === "instagram" && row.posts.length) await recordCreatorAds(db, c, row.posts, search.id).catch(() => 0);
     row.trust = await trustOf(ctx, row, null);
     row.reject.push(...evaluateCriteria(ctx.criteria, search, factsOf(row, now)).reject);
   }

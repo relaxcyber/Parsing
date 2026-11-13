@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { eq } from "drizzle-orm";
-import { distinctCreators } from "@/brands";
+import { scoutMetrics } from "@/brands";
 import { getDb } from "@/db/client";
 import { brandScouts, type BrandLead } from "@/db/schema";
 import { CopyButton } from "../../creators/print-button";
@@ -9,6 +9,7 @@ import { ConfirmButton } from "../../keys/confirm-button";
 import { AutoRefresh } from "../../search/auto-refresh";
 import { brandVerdictAction, creatorAction, deleteScoutAction, pitchAction, queuePitchesAction, rerunScoutAction } from "../actions";
 import { CreatorFields } from "../creator-fields";
+import { Numbers } from "../numbers";
 import { SCOUT_STATUS, VERDICT } from "../labels";
 
 const n = (v: number | null) => (v == null ? "—" : v.toLocaleString("uk-UA"));
@@ -43,6 +44,7 @@ export default async function ScoutPage({ params, searchParams }: { params: Prom
   const { msg } = await searchParams;
   const [s] = await getDb().select().from(brandScouts).where(eq(brandScouts.id, id));
   if (!s) notFound();
+  const metrics = await scoutMetrics(getDb(), s);
   const st = SCOUT_STATUS[s.status];
   const busy = s.status === "queued" || s.status === "running" || s.pitchQueue.length > 0;
   const shown = s.brands.filter((b) => b.verdict !== "not_brand");
@@ -53,7 +55,6 @@ export default async function ScoutPage({ params, searchParams }: { params: Prom
 
   const row = (l: BrandLead) => {
     const v = VERDICT[l.verdict];
-    const creators = [...new Map(l.collabs.map((c) => [c.creator, c])).values()];
     return (
       <tr key={l.handle}>
         <td>
@@ -62,14 +63,7 @@ export default async function ScoutPage({ params, searchParams }: { params: Prom
           {l.category && <div className="muted">{l.category}</div>}
         </td>
         <td>{n(l.followers)}</td>
-        <td>
-          <b>{distinctCreators(l.collabs)}</b>{l.collabs.some((c) => c.paid) && <span className="risk-low"> · платне партнерство</span>}
-          <div className="muted">
-            {creators.slice(0, 3).map((c, i) => (
-              <span key={c.postUrl}>{i > 0 && ", "}<a href={c.postUrl} target="_blank" rel="noreferrer">@{c.creator}</a>{c.at && ` (${day(c.at)})`}</span>
-            ))}
-          </div>
-        </td>
+        <td><Numbers m={metrics.get(l.handle)!} /></td>
         <td>
           {l.email ? <><b>{l.email}</b><div className="muted">{l.emailSource?.startsWith("http") ? "з сайту" : l.emailSource}</div></> : <span className="muted">немає</span>}
           {l.website && <div><a href={l.website} target="_blank" rel="noreferrer">{l.website.replace(/^https?:\/\/(www\.)?/, "").slice(0, 40)}</a></div>}
@@ -123,7 +117,7 @@ export default async function ScoutPage({ params, searchParams }: { params: Prom
             <p className="empty">Реклами з відмітками брендів не знайдено. Спробуйте інші хештеги (вужчі, ті, де автори показують товари) або більший обсяг.</p>
           ) : (
             <table>
-              <thead><tr><th>Бренд</th><th>Підписники</th><th>Авторів працювало</th><th>Контакт</th><th>Чи бренд</th><th>Лист</th></tr></thead>
+              <thead><tr><th>Бренд</th><th>Підписники</th><th>Співпраця з авторами</th><th>Контакт</th><th>Чи бренд</th><th>Лист</th></tr></thead>
               <tbody>{shown.map(row)}</tbody>
             </table>
           )}
@@ -134,7 +128,9 @@ export default async function ScoutPage({ params, searchParams }: { params: Prom
             </details>
           )}
           <p className="muted">
-            «Авторів працювало»: скільки різних авторів з вибірки мали рекламу з відміткою цього бренду; посилання ведуть на самі дописи.
+            Цифри — з публічних рекламних дописів у всій вашій базі (кожен пошук авторів поповнює її безкоштовно): скільки різних авторів мали рекламу
+            бренду, скільки з них за 90 днів, з кількома працював повторно, розмір цих авторів, вподобання реклами до підписників і опубліковані ставки
+            за UGC у цих авторів. Скільки платить сам бренд, з публічних даних не видно.
             Email: з біо Instagram або з головної чи контактної сторінки сайту, домен перевірено на наявність пошти.
           </p>
         </section>

@@ -3,7 +3,7 @@
 import { eq } from "drizzle-orm";
 import { redirect } from "next/navigation";
 import { z } from "zod";
-import { createScout, pitchBrand, queuePitches, setBrandVerdict } from "@/brands";
+import { createScout, ITEM_USD, pitchBrand, queuePitches, requestVerify, setAccountVerdict, setBrandVerdict, VERIFY_BATCH } from "@/brands";
 import { getDb } from "@/db/client";
 import { brandScouts, type BrandCreator, type BrandScout } from "@/db/schema";
 import { requireAuth } from "@/lib/auth";
@@ -84,6 +84,29 @@ export async function rerunScoutAction(form: FormData) {
   const s = await load(idOf(form));
   await getDb().update(brandScouts).set({ status: "queued", error: null, stage: null, updatedAt: new Date() }).where(eq(brandScouts.id, s.id));
   go(`/brands/${s.id}`, "Запущено знову: уже зібрані за останні 6 годин дописи не оплачуються вдруге");
+}
+
+const baseUrl = (form: FormData, msg?: string) => {
+  const q = new URLSearchParams(str(form, "query", 400));
+  if (msg) q.set("msg", msg);
+  const qs = q.toString();
+  return `/brands/base${qs ? `?${qs}` : ""}`;
+};
+
+export async function requestVerifyAction(form: FormData) {
+  await requireAuth();
+  const ids = form.getAll("ids").map(Number).filter((n) => Number.isInteger(n) && n > 0).slice(0, 200);
+  const n = await requestVerify(getDb(), ids);
+  redirect(baseUrl(form, n
+    ? `У черзі на перевірку ${n} профілів (${n * ITEM_USD < 0.01 ? "менше $0.01" : `≈ $${(n * ITEM_USD).toFixed(2)}`} Apify): фоновий виконавець бере по ${VERIFY_BATCH} за раз`
+    : "Немає неперевірених брендів у цьому списку"));
+}
+
+export async function accountVerdictAction(form: FormData) {
+  await requireAuth();
+  const verdict = z.enum(["brand", "not_brand"]).parse(form.get("verdict"));
+  await setAccountVerdict(getDb(), str(form, "handle", 60), verdict);
+  redirect(baseUrl(form));
 }
 
 export async function deleteScoutAction(form: FormData) {

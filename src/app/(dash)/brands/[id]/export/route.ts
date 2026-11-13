@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import { brandsCsv } from "@/brands";
+import { rowsCsv, scoutMetrics, scoutRows } from "@/brands";
 import { getDb } from "@/db/client";
 import { brandScouts } from "@/db/schema";
 import { isAuthed } from "@/lib/auth";
@@ -13,7 +13,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const [s] = Number.isInteger(id) ? await getDb().select().from(brandScouts).where(eq(brandScouts.id, id)) : [];
   if (!s) return new Response("Not found", { status: 404 });
   const name = s.niche.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-|-$/g, "").slice(0, 40) || "brands";
-  return new Response(brandsCsv(s).csv, {
+  const { csv } = rowsCsv(scoutRows(s, await scoutMetrics(getDb(), s)));
+  return new Response(csv, {
     headers: {
       "content-type": "text/csv; charset=utf-8",
       "content-disposition": `attachment; filename="brands-${encodeURIComponent(name)}.csv"`,

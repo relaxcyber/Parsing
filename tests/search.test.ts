@@ -4,7 +4,7 @@ import sharp from "sharp";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { collagePath, deepCollagePath, groundVision, qualityIndex, VisionReplySchema } from "@/audit/vision";
-import { contentItems, creatorContacts, creators, searchCandidates, searches, suppressions, usageEvents } from "@/db/schema";
+import { brandAccounts, brandCollabs, contentItems, creatorContacts, creators, searchCandidates, searches, suppressions, usageEvents } from "@/db/schema";
 import { activityOf } from "@/enrich/activity";
 import { checkEmail } from "@/enrich/email";
 import { extractLinkPage } from "@/enrich/linkpage";
@@ -345,6 +345,29 @@ describe("search pipeline", () => {
     expect(done.stats.note).toMatch(/Мовна модель недоступна/);
     const by = await candidates(db);
     expect(by.anna.cand).toMatchObject({ stage: "qualified", quality: null, lead: false });
+  });
+
+  it("collects brands from the creators' ads along the way, for free", async () => {
+    const db = await testDb();
+    await addTestKey(db, "apify", "ap");
+    await addTestKey(db, "groq", "gq");
+    const withAd = {
+      ...profiles,
+      anna: { ...profiles.anna, latestPosts: [...profiles.anna.latestPosts, {
+        shortCode: "anna-AD", url: "https://www.instagram.com/p/anna-AD/", type: "Image", caption: "my new serum", timestamp: daysAgo(4),
+        ownerUsername: "anna", paidPartnership: true, taggedUsers: [{ username: "glowlab" }], likesCount: 260,
+      }] },
+    };
+    const { mock, calls } = await world(posts, withAd, { pages });
+    vi.stubGlobal("fetch", mock);
+    await newSearch(db);
+    await runNextSearch(db);
+    const [b] = await db.select().from(brandAccounts);
+    expect(b).toMatchObject({ handle: "glowlab", verdict: null });
+    const [c] = await db.select().from(brandCollabs);
+    expect(c).toMatchObject({ brandId: b.id, creator: "anna", creatorFollowers: 5200, paid: true, likes: 260 });
+    // Профіль бренду не купувався: лише хештег і пачка профілів авторів.
+    expect(calls.profileInputs.flat()).not.toContain("glowlab");
   });
 
   it("rejects on audit findings: children as main subject and low quality", async () => {

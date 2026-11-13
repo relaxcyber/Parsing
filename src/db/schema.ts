@@ -803,7 +803,7 @@ export type Order = typeof orders.$inferSelect;
 /* ---------- Бренди для креаторів: хто вже платить авторам у ніші ---------- */
 
 /** Доказ співпраці: рекламний допис автора з відміткою бренду. */
-export type BrandCollab = { creator: string; followers: number | null; postUrl: string; reason: string; paid: boolean; at: string | null };
+export type BrandCollab = { creator: string; followers: number | null; postUrl: string; reason: string; paid: boolean; at: string | null; likes?: number | null; comments?: number | null };
 export type BrandVerdict = "brand" | "not_brand" | "unsure";
 export type BrandLead = {
   handle: string;
@@ -846,3 +846,50 @@ export const brandScouts = pgTable("brand_scouts", {
 }).enableRLS();
 
 export type BrandScout = typeof brandScouts.$inferSelect;
+
+/* ---------- База брендів: накопичується з кожного пошуку авторів і пошуку брендів ---------- */
+
+export const brandAccounts = pgTable("brand_accounts", {
+  id: serial("id").primaryKey(),
+  platform: text("platform").notNull().default("instagram"),
+  handle: text("handle").notNull(),
+  name: text("name"),
+  bio: text("bio"),
+  category: text("category"),
+  followers: integer("followers"),
+  website: text("website"),
+  email: text("email"),
+  emailSource: text("email_source"),
+  /** null — профіль ще не перевіряли (відмітка в рекламі є, але чи це бренд — невідомо). */
+  verdict: text("verdict").$type<BrandVerdict>(),
+  verdictWhy: text("verdict_why"),
+  byYou: boolean("by_you").notNull().default(false),
+  checkedAt: ts("checked_at"),
+  /** Ви попросили перевірити профіль (платно): фоновий виконавець бере такі пачками. */
+  verifyRequestedAt: ts("verify_requested_at"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+}, (t) => [uniqueIndex("brand_accounts_handle_idx").on(t.platform, t.handle)]).enableRLS();
+
+export type BrandAccount = typeof brandAccounts.$inferSelect;
+
+/** Рекламний допис автора з відміткою бренду: з них рахуються всі цифри бренду. */
+export const brandCollabs = pgTable("brand_collabs", {
+  id: serial("id").primaryKey(),
+  brandId: integer("brand_id").notNull().references(() => brandAccounts.id, { onDelete: "cascade" }),
+  creator: text("creator").notNull(),
+  creatorId: integer("creator_id").references(() => creators.id, { onDelete: "set null" }),
+  creatorFollowers: integer("creator_followers"),
+  postUrl: text("post_url").notNull(),
+  paid: boolean("paid").notNull().default(false),
+  reason: text("reason"),
+  at: ts("at"),
+  likes: integer("likes"),
+  comments: integer("comments"),
+  views: integer("views"),
+  searchId: integer("search_id").references(() => searches.id, { onDelete: "set null" }),
+  scoutId: integer("scout_id").references(() => brandScouts.id, { onDelete: "set null" }),
+  seenAt: ts("seen_at").notNull().defaultNow(),
+}, (t) => [uniqueIndex("brand_collabs_post_idx").on(t.brandId, t.postUrl), index("brand_collabs_creator_idx").on(t.creator)]).enableRLS();
+
+export type BrandCollabRow = typeof brandCollabs.$inferSelect;

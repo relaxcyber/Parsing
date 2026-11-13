@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  AGENCY, brandsCsv, brandVerdict, checkPitch, pageEmails, collectCollabs, createScout, pickEmail, pitchFacts, queuePitches, rankCollabs, runBrandScouts, setBrandVerdict,
+  AGENCY, brandBase, brandMetrics, brandVerdict, recordCreatorAds, requestVerify, rowsCsv, runBrandVerify, scoutMetrics, scoutRows, sizeFits, checkPitch, pageEmails, collectCollabs, createScout, pickEmail, pitchFacts, queuePitches, rankCollabs, runBrandScouts, setBrandVerdict,
 } from "@/brands";
 import type { PostFacts } from "@/analysis/posts";
-import { brandScouts, type BrandCreator, type BrandLead } from "@/db/schema";
+import { brandAccounts, brandScouts, creators, searches, type BrandCreator, type BrandLead } from "@/db/schema";
 import { addTestKey, testDb } from "./helpers";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -187,11 +187,76 @@ describe("brands for a creator end to end", () => {
     // Ваше рішення: фотограф — бренд (наприклад, студія); файл без «не бренд».
     await setBrandVerdict(db, id, "carlphoto", "not_brand");
     [s] = await db.select().from(brandScouts).where(eq(brandScouts.id, id));
-    const { csv, rows } = brandsCsv(s);
+    const { csv, rows } = rowsCsv(scoutRows(s, await scoutMetrics(db, s)));
     expect(rows).toBe(2);
-    const lines = csv.replace(/^﻿/, "").trim().split(/\r?\n/);
-    expect(lines[0]).toBe("brand,instagram,name,category,followers,website,email,creators_worked_with,example_creators,example_post,last_collab,paid_partnership,email_subject,email_body");
-    expect(lines[1]).toMatch(/^pawsomeco,https:\/\/www\.instagram\.com\/pawsomeco\/,Pawsome,Pet Supplies,54000,https:\/\/pawsome\.co,partnerships@pawsome\.co,2,"anna, ben"/);
+    const lines = csv.replace(/^\uFEFF/, "").trim().split(/\r?\n/);
+    expect(lines[0]).toBe("brand,instagram,name,category,brand_followers,website,email,creators_worked_with,creators_last_90_days,repeat_creators,sponsored_posts,"
+      + "paid_partnership_posts,last_collab,creator_size,sponsored_post_er_pct,creator_ugc_rates_usd,example_creators,example_post,email_subject,email_body");
+    expect(lines[1]).toMatch(/^pawsomeco,https:\/\/www\.instagram\.com\/pawsomeco\/,Pawsome,Pet Supplies,54000,https:\/\/pawsome\.co,partnerships@pawsome\.co,2,2,0,2,0,2026-10-02,8K–12K \(median 10K\),,,"anna, ben",https:\/\/www\.instagram\.com\/p\//);
+    // Перевірені профілі й ваше рішення — у загальній базі брендів.
+    const accounts = Object.fromEntries((await db.select().from(brandAccounts)).map((a) => [a.handle, a]));
+    expect(accounts.pawsomeco).toMatchObject({ verdict: "brand", email: "partnerships@pawsome.co" });
+    expect(accounts.pawsomeco.checkedAt).not.toBeNull();
+    expect(accounts.carlphoto).toMatchObject({ verdict: "not_brand", byYou: true });
     expect(csv).not.toMatch(/carlphoto/);
+  });
+});
+
+describe("brand base from creator searches", () => {
+  const day = (n: number) => new Date(Date.now() - n * 86_400_000);
+  const ad = (code: string, tagged: string[], likes: number, at: Date, paid = false) =>
+    fact({ shortCode: code, caption: "#ad new collar", tagged, likes, paid, publishedAt: at });
+
+  it("collects brands from every creator search for free and counts the numbers buyers look at", async () => {
+    const db = await testDb();
+    const [search] = await db.insert(searches).values({ name: "t", hashtags: ["dogs"] }).returning();
+    const [mia, zoe] = await db.insert(creators).values([
+      { platform: "instagram", username: "mia", followers: 9000, rates: [{ title: "UGC video", amount: 150, currency: "USD", sourceUrl: "https://beacons.ai/mia" }] },
+      { platform: "instagram", username: "zoe", followers: 30000 },
+    ]).returning();
+    await recordCreatorAds(db, mia, [ad("m1", ["cozycollar"], 450, day(10), true), ad("m2", ["zoe"], 100, day(5))], search.id);
+    await recordCreatorAds(db, zoe, [ad("z1", ["cozycollar"], 600, day(20)), ad("z2", ["cozycollar"], 600, day(200)), fact({ shortCode: "z3", caption: "my dog", tagged: ["oldbrand"] })], search.id);
+    // Повтор того самого допису не дублюється.
+    await recordCreatorAds(db, mia, [ad("m1", ["cozycollar"], 450, day(10), true)], search.id);
+
+    const rows = await brandBase(db);
+    // Відмітка іншого автора (zoe) — не бренд; допис без реклами — не доказ.
+    expect(rows.map((r) => r.a.handle)).toEqual(["cozycollar"]);
+    const m = rows[0].m;
+    expect(m).toMatchObject({ creators: 2, active90: 2, posts: 3, paidPosts: 1, repeatCreators: 1, followers: { min: 9000, median: 19500, max: 30000 }, adEr: 2, rates: { min: 150, max: 150, creators: 1 } });
+    expect(m.examples.map((e) => e.creator)).toEqual(["zoe", "mia"]);
+    expect(sizeFits(m, 8000)).toBe(true);
+    expect((await brandBase(db, { size: 100_000 })).length).toBe(0);
+    expect((await brandBase(db, { min: 3 })).length).toBe(0);
+    expect((await brandBase(db, { q: "collar" })).length).toBe(1);
+    expect(brandMetrics([]).followers).toBeNull();
+
+    // Платна перевірка профілю на ваш запит: вердикт коду, email з біо.
+    await addTestKey(db, "apify", "ap");
+    const runs = new Map<string, any[]>();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: any) => {
+      if (url.includes("/users/me/limits")) return Response.json({ data: { limits: { maxMonthlyUsageUsd: 5 }, current: { monthlyUsageUsd: 0.1 } } });
+      if (url.includes("/runs?")) {
+        const id = `run${runs.size + 1}`;
+        runs.set(id, JSON.parse(init.body).usernames.map((u: string) => u === "cozycollar"
+          ? { username: u, fullName: "Cozy Collar", biography: "Soft collars. hello@cozycollar.com", followersCount: 7000, businessCategoryName: "Pet Supplies", externalUrl: "https://cozycollar.com" }
+          : { error: "not_found" }));
+        return Response.json({ data: { id, status: "RUNNING", defaultDatasetId: id } });
+      }
+      const run = url.match(/actor-runs\/(run\d+)/)?.[1];
+      if (run) return Response.json({ data: { id: run, status: "SUCCEEDED", defaultDatasetId: run, usageTotalUsd: 0.01 } });
+      const ds = url.match(/datasets\/(run\d+)\/items/)?.[1];
+      if (ds) return Response.json(runs.get(ds));
+      return new Response("not found", { status: 404 });
+    }));
+    expect(await runBrandVerify(db)).toBe(false);
+    expect(await requestVerify(db, [rows[0].a.id])).toBe(1);
+    expect(await runBrandVerify(db)).toBe(true);
+    expect(await runBrandVerify(db)).toBe(false);
+    const [a] = await db.select().from(brandAccounts).where(eq(brandAccounts.handle, "cozycollar"));
+    expect(a).toMatchObject({ verdict: "brand", email: "hello@cozycollar.com", category: "Pet Supplies", followers: 7000, verifyRequestedAt: null });
+    expect((await brandBase(db, { emailOnly: true, show: "checked" })).map((r) => r.a.handle)).toEqual(["cozycollar"]);
+    // Уже перевірений повторно не ставиться в чергу.
+    expect(await requestVerify(db, [a.id])).toBe(0);
   });
 });
