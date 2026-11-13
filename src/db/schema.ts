@@ -661,3 +661,54 @@ export type Client = typeof clients.$inferSelect;
 export type Mailbox = typeof mailboxes.$inferSelect;
 export type OutreachThread = typeof outreachThreads.$inferSelect;
 export type OutreachMessage = typeof outreachMessages.$inferSelect;
+
+/* ---------- Відгук на замовлення (Upwork тощо) ---------- */
+
+/** Розбір тексту замовлення: кожен факт — з дослівною цитатою з нього. */
+export type JobAnalysis = {
+  title: string;
+  /** Що хоче замовник — українською, щоб не перекладати самому. */
+  summaryUk: string;
+  /** find_creators і manage_outreach — ваша робота; be_a_creator — шукають самого автора контенту. */
+  jobType: "find_creators" | "manage_outreach" | "be_a_creator" | "other";
+  platform: "instagram" | "tiktok" | "both" | "unknown";
+  focus: "ugc" | "affiliate";
+  niche: string;
+  creatorsNeeded: { count: number; quote: string } | null;
+  /** Діапазон підписників із замовлення (5k–60k): ним обмежуємо пошук і приклади. */
+  followers?: { min: number | null; max: number | null; quote: string } | null;
+  budget: { amount: number; kind: "fixed" | "hourly" | "unknown"; quote: string } | null;
+  requirements: { text: string; quote: string }[];
+  redFlags: { text: string; quote: string }[];
+  questions: string[];
+  dropped: number;
+};
+
+/** Ваші дані для відгуку: модель не додає досвіду чи цифр понад те, що тут написано. */
+export type PitchProfile = { name: string; about: string; offer: string };
+
+/** Автор-приклад у відгуку: без email — контакти віддаємо лише після замовлення. */
+export type PitchSample = {
+  creatorId: number; handle: string; platform: string; url: string;
+  followers: number | null; followersShort: string | null; erPct: string | null; country: string | null; hasEmail: boolean; why: string | null;
+};
+
+export const jobPitches = pgTable("job_pitches", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  jobText: text("job_text").notNull(),
+  profile: jsonb("profile").$type<PitchProfile>().notNull(),
+  analysis: jsonb("analysis").$type<JobAnalysis>(),
+  proposal: text("proposal"),
+  /** Переклад відгуку українською — щоб ви розуміли, що надсилаєте. */
+  proposalUk: text("proposal_uk"),
+  issues: jsonb("issues").$type<string[]>().notNull().default([]),
+  samples: jsonb("samples").$type<PitchSample[]>().notNull().default([]),
+  searchId: integer("search_id").references(() => searches.id, { onDelete: "set null" }),
+  /** Ви вже відправили відгук і чим закінчилось — для статистики відгуків. */
+  status: text("status").$type<"draft" | "sent" | "replied" | "won" | "lost">().notNull().default("draft"),
+  createdAt: ts("created_at").notNull().defaultNow(),
+  updatedAt: ts("updated_at").notNull().defaultNow(),
+}).enableRLS();
+
+export type JobPitch = typeof jobPitches.$inferSelect;

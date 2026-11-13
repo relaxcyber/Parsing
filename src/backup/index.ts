@@ -28,7 +28,7 @@ export const TABLES: [string, PgTable][] = [
   ["creators", schema.creators], ["creator_snapshots", schema.creatorSnapshots], ["creator_contacts", schema.creatorContacts],
   ["suppressions", schema.suppressions], ["search_candidates", schema.searchCandidates], ["content_items", schema.contentItems],
   ["collect_runs", schema.collectRuns], ["outreach_drafts", schema.outreachDrafts], ["outreach_threads", schema.outreachThreads],
-  ["outreach_messages", schema.outreachMessages], ["eval_runs", schema.evalRuns], ["scrape_jobs", schema.scrapeJobs], ["scrape_results", schema.scrapeResults],
+  ["outreach_messages", schema.outreachMessages], ["job_pitches", schema.jobPitches], ["eval_runs", schema.evalRuns], ["scrape_jobs", schema.scrapeJobs], ["scrape_results", schema.scrapeResults],
 ];
 
 export const backupName = (d = new Date()) => `parsing-${d.toISOString().slice(0, 10)}.jsonl.gz`;
